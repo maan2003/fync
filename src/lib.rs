@@ -1,13 +1,10 @@
 use anyhow::Result;
+use iroh_blake3::Hash as ContentHash;
 use std::{collections::BTreeMap, time::SystemTime};
-
-fn main() {
-    println!("Hello, world!");
-}
 
 struct FileName(Arc<str>);
 struct FileMetadata {
-    content_hash: iroh_blake3::Hash,
+    content_hash: ContentHash,
     mtime: SystemTime,
 }
 
@@ -78,6 +75,38 @@ impl FsState {
 
         FsStateDiff { files }
     }
+
+    pub fn check_diff(&self, diff: &FsStateDiff) -> bool {
+        for (file_name, change) in &diff.files {
+            match change {
+                FileChange::Removed { old_meta } => {
+                    if let Some(current_meta) = self.files.get(file_name) {
+                        if current_meta.content_hash != old_meta.content_hash {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                FileChange::Created { .. } => {
+                    if self.files.contains_key(file_name) {
+                        return false;
+                    }
+                }
+                FileChange::Modified { old_meta, .. } => {
+                    if let Some(current_meta) = self.files.get(file_name) {
+                        if current_meta.content_hash != old_meta.content_hash {
+                            return false;
+                        }
+                        // TODO: check mtime
+                    } else {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
 }
 
 #[derive(Debug)]
@@ -100,7 +129,7 @@ enum FileChange {
 }
 
 impl FsStateDiff {
-    pub fn apply_diff(&self, root: &Path) -> Result<()> {
+    pub fn apply_diff(&self, root: &Path, content_store: &ContentStore) -> Result<()> {
         for (file_name, change) in &self.files {
             let full_path = root.join(file_name.0.as_ref());
             match change {
@@ -111,13 +140,42 @@ impl FsStateDiff {
                     if let Some(parent) = full_path.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
-                    std::fs::write(&full_path, &[])?;
+                    let content = content_store.get(&meta.content_hash)?;
+                    std::fs::write(&full_path, content)?;
                 }
                 FileChange::Modified { new_meta, .. } => {
-                    // TODO: modify
+                    let content = content_store.get(&new_meta.content_hash)?;
+                    std::fs::write(&full_path, content)?;
                 }
             }
         }
         Ok(())
+    }
+}
+
+#[derive(Default, Debug)]
+struct ContentStore {
+    contents: BTreeMap<ContentHash, Vec<u8>>,
+}
+
+impl ContentStore {
+    fn add(&mut self, content: Vec<u8>) -> ContentHash {
+        let hash = iroh_blake3::hash(&content);
+        self.contents.insert(hash, content);
+        hash
+    }
+
+    fn get(&self, hash: &ContentHash) -> Result<&[u8]> {
+        self.contents
+            .get(hash)
+            .ok_or_else(|| anyhow::anyhow!("Content not found in store"))
+    }
+
+    fn remove(&mut self, hash: &ContentHash) {
+        self.contents.remove(hash);
+    }
+
+    fn has(&self, hash: &ContentHash) -> bool {
+        self.contents.contains_key(hash)
     }
 }
