@@ -1,10 +1,15 @@
 use anyhow::Result;
 use iroh_blake3::Hash as ContentHash;
+use notify_debouncer_full::{
+    new_debouncer,
+    notify::{RecommendedWatcher, RecursiveMode, Watcher},
+    DebouncedEvent, Debouncer, FileIdCache,
+};
 use std::{
     collections::{BTreeMap, HashMap},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
-    time::SystemTime,
+    time::Duration,
 };
 
 #[derive(Debug, Eq, PartialOrd, Ord, PartialEq, Clone)]
@@ -32,7 +37,9 @@ impl FsState {
                 std::io::copy(&mut file, &mut hasher)?;
                 let content_hash = hasher.finalize();
                 let mtime = entry.metadata()?.modified()?;
-                let file_name = FilePath(Arc::from(path.to_string_lossy().as_ref()));
+                let file_name = FilePath(Arc::from(
+                    path.strip_prefix(root)?.to_string_lossy().as_ref(),
+                ));
                 let metadata = FileMetadata {
                     content_hash,
                     // mtime,
@@ -41,6 +48,33 @@ impl FsState {
             }
         }
         Ok(FsState { files })
+    }
+
+    pub fn refresh_path(&mut self, root: &Path, file: &Path) -> Result<()> {
+        let relative_path = file.strip_prefix(root)?;
+        let file_name = FilePath(Arc::from(relative_path.to_string_lossy().as_ref()));
+
+        if file.is_file() {
+            let mut file_handle = std::fs::File::open(file)?;
+            let mut hasher = iroh_blake3::Hasher::new();
+            std::io::copy(&mut file_handle, &mut hasher)?;
+            let content_hash = hasher.finalize();
+
+            let metadata = FileMetadata { content_hash };
+
+            self.files.insert(file_name, metadata);
+        } else {
+            self.files.remove(&file_name);
+        }
+
+        Ok(())
+    }
+
+    pub fn refresh_paths(&mut self, root: &Path, paths: &[PathBuf]) -> Result<()> {
+        for path in paths {
+            self.refresh_path(root, path)?;
+        }
+        Ok(())
     }
 
     pub fn diff(&self, next: &Self) -> FsStateDiff {
@@ -247,6 +281,26 @@ impl Node {
     pub fn is_settle(&self) -> bool {
         self.this_state == self.other_state
     }
+}
+
+// TODO: don't watch git ignored paths
+pub fn watch_root(
+    root: &Path,
+    handler: Fn(Vec<PathBuf>),
+) -> Result<Debouncer<RecommendedWatcher, FileIdCache>> {
+    let mut debouncer = new_debouncer(
+        Duration::from_millis(10),
+        None,
+        move |result: Result<Vec<DebouncedEvent>, _>| match result {
+            Ok(events) => handler(events.into_iter().flat_map(|x| x.paths).collect()),
+            Err(e) => eprintln!("Error in file watcher: {:?}", e),
+        },
+    )?;
+
+    // TODO: check how this interacts with new directories
+    // FIXME: this wasted effort by walking the tree *once again*
+    debouncer.watcher().watch(root, RecursiveMode::Recursive)?;
+    Ok(debouncer)
 }
 
 #[cfg(test)]
