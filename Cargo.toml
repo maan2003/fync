@@ -1,0 +1,11 @@
+[package]
+name = "fync"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.89"
+ignore = "0.4.23"
+iroh-blake3 = "1.4.5"
+tokio = "1.40.0"
+walkdir = "2.5.0"
