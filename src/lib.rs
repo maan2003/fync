@@ -429,6 +429,7 @@ mod tests {
             self.files.remove(&file_path);
         }
     }
+
     #[test]
     fn test_fs_state() {
         // Create a new ContentStore and add two content hashes
@@ -504,5 +505,174 @@ mod tests {
         // Check if both nodes have the same state
         assert_eq!(node1.this_state, node2.this_state);
         assert_eq!(node1.other_state, node2.other_state);
+    }
+
+    #[test]
+    fn test_concurrent_changes() {
+        let mut cs = ContentStore::default();
+
+        let h1 = cs.add(b"content1".to_vec());
+        let h2 = cs.add(b"content2".to_vec());
+        let h3 = cs.add(b"content3".to_vec());
+
+        let mut state1 = FsState::empty();
+        state1.insert_file("file1.txt", h1);
+        state1.insert_file("file2.txt", h2);
+
+        // file1 rm
+        let mut state2 = state1.clone();
+        state2.remove_file("file1.txt");
+
+        let mut state3 = state1.clone();
+        // file3 create
+        state3.insert_file("file3.txt", h3);
+
+        let mut node1 = Node::new(state2, state1.clone());
+        let mut node2 = Node::new(state3, state1);
+        let diff_for_1 = node2.changes_for_other();
+        let diff_for_2 = node1.changes_for_other();
+
+        // Apply changes to both nodes
+        node1.apply_changes_from_other_mem(&diff_for_1);
+        node2.apply_changes_from_other_mem(&diff_for_2);
+
+        // Check for conflicts
+        assert!(!node1.has_conflicts());
+        assert!(!node2.has_conflicts());
+
+        // Verify that the nodes are not settled
+        assert_ne!(node1.this_state, node1.other_state);
+
+        // Verify that the states are different
+        assert_eq!(node1.this_state, node2.this_state);
+
+        node1.changes_acked_by_other(&diff_for_2);
+        node2.changes_acked_by_other(&diff_for_1);
+
+        assert!(node1.is_settle());
+        assert!(node2.is_settle());
+    }
+
+    #[test]
+    fn test_conflicting_changes() {
+        let mut cs = ContentStore::default();
+
+        let h1 = cs.add(b"content1".to_vec());
+        let h2 = cs.add(b"content2".to_vec());
+        let h3 = cs.add(b"content3".to_vec());
+
+        let mut state1 = FsState::empty();
+        state1.insert_file("file1.txt", h1);
+        state1.insert_file("file2.txt", h2);
+
+        // Node 1 modifies file1.txt
+        let mut state2 = state1.clone();
+        state2.insert_file("file1.txt", h3);
+
+        // Node 2 also modifies file1.txt, but differently
+        let mut state3 = state1.clone();
+        state3.insert_file("file1.txt", h2);
+
+        let mut node1 = Node::new(state2, state1.clone());
+        let mut node2 = Node::new(state3, state1);
+
+        let diff_for_1 = node2.changes_for_other();
+        let diff_for_2 = node1.changes_for_other();
+
+        // Apply changes to both nodes
+        node1.apply_changes_from_other_mem(&diff_for_1);
+        node2.apply_changes_from_other_mem(&diff_for_2);
+
+        // Check for conflicts
+        assert!(node1.has_conflicts());
+        assert!(node2.has_conflicts());
+
+        // Verify that the nodes are not settled
+        assert!(!node1.is_settle());
+        assert!(!node2.is_settle());
+
+        // Verify that the conflicted file is "file1.txt"
+        assert_eq!(node1.conflicts, vec![FilePath(Arc::from("file1.txt"))]);
+        assert_eq!(node2.conflicts, vec![FilePath(Arc::from("file1.txt"))]);
+    }
+
+    #[test]
+    fn test_conflicting_concurrent_create() {
+        let mut cs = ContentStore::default();
+
+        let h1 = cs.add(b"content1".to_vec());
+        let h2 = cs.add(b"content2".to_vec());
+
+        let mut state1 = FsState::empty();
+        state1.insert_file("file1.txt", h1);
+
+        // Node 1 creates a new file
+        let mut state2 = state1.clone();
+        state2.insert_file("file2.txt", h2);
+
+        // Node 2 modifies the same file
+        let mut state3 = state1.clone();
+        state3.insert_file("file2.txt", h1);
+
+        let mut node1 = Node::new(state2, state1.clone());
+        let mut node2 = Node::new(state3, state1);
+
+        let diff_for_1 = node2.changes_for_other();
+        let diff_for_2 = node1.changes_for_other();
+
+        // Apply changes to both nodes
+        node1.apply_changes_from_other_mem(&diff_for_1);
+        node2.apply_changes_from_other_mem(&diff_for_2);
+
+        // Check for conflicts
+        assert!(node1.has_conflicts());
+        assert!(node2.has_conflicts());
+
+        // Verify that the conflicted file is "file2.txt"
+        assert_eq!(node1.conflicts, vec![FilePath(Arc::from("file2.txt"))]);
+        assert_eq!(node2.conflicts, vec![FilePath(Arc::from("file2.txt"))]);
+    }
+
+    #[test]
+    fn test_concurrent_create_same_file_same_content() {
+        let mut cs = ContentStore::default();
+
+        let h1 = cs.add(b"content1".to_vec());
+        let h2 = cs.add(b"same_content".to_vec());
+
+        let mut state1 = FsState::empty();
+        state1.insert_file("file1.txt", h1);
+
+        // Node 1 creates a new file
+        let mut state2 = state1.clone();
+        state2.insert_file("file2.txt", h2);
+
+        // Node 2 creates the same file with the same content
+        let mut state3 = state1.clone();
+        state3.insert_file("file2.txt", h2);
+
+        let mut node1 = Node::new(state2.clone(), state1.clone());
+        let mut node2 = Node::new(state3.clone(), state1.clone());
+
+        let diff_for_1 = node2.changes_for_other();
+        let diff_for_2 = node1.changes_for_other();
+
+        // Apply changes to both nodes
+        node1.apply_changes_from_other_mem(&diff_for_1);
+        node2.apply_changes_from_other_mem(&diff_for_2);
+
+        // Check for conflicts (should be none)
+        assert!(!node1.has_conflicts());
+        assert!(!node2.has_conflicts());
+
+        // Verify that the nodes are settled
+        assert!(node1.is_settle());
+        assert!(node2.is_settle());
+
+        // Verify that both nodes have the same state
+        assert_eq!(node1.this_state, node2.this_state);
+
+        assert_eq!(node1.this_state, state3);
+        assert_eq!(node1.this_state, state2);
     }
 }
