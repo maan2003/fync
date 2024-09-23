@@ -1,4 +1,5 @@
 // FIXME: protect against attacks
+// TODO: landlock support
 
 use anyhow::{bail, Result};
 use iroh_blake3::Hash as ContentHash;
