@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.89"
+clap = { version = "4.5.18", features = ["derive"] }
 ignore = "0.4.23"
 iroh-blake3 = "1.4.5"
 notify-debouncer-full = "0.3.1"

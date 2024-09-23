@@ -295,6 +295,7 @@ impl ContentStore {
     }
 }
 
+#[derive(Debug)]
 pub struct Node {
     this_state: FsState,
     other_state: FsState,
