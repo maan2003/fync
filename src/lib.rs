@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use iroh_blake3::Hash as ContentHash;
 use notify_debouncer_full::{
     new_debouncer,
@@ -6,7 +6,7 @@ use notify_debouncer_full::{
     DebouncedEvent, Debouncer, FileIdMap,
 };
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{btree_map, BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -46,31 +46,67 @@ impl FsState {
         Ok(FsState { files })
     }
 
-    pub fn refresh_path(&mut self, root: &Path, file: &Path) -> Result<()> {
+    pub fn refresh_path(
+        &mut self,
+        root: &Path,
+        file: &Path,
+        content_store: &mut ContentStore,
+    ) -> Result<Option<FileChange>> {
         let relative_path = file.strip_prefix(root)?;
         let file_name = FilePath(Arc::from(relative_path.to_string_lossy().as_ref()));
 
         if file.is_file() {
-            let mut file_handle = std::fs::File::open(file)?;
-            let mut hasher = iroh_blake3::Hasher::new();
-            std::io::copy(&mut file_handle, &mut hasher)?;
-            let content_hash = hasher.finalize();
+            let content = std::fs::read(file)?;
+            let content_hash = content_store.add(content);
 
-            let metadata = FileMetadata { content_hash };
+            let new_metadata = FileMetadata { content_hash };
 
-            self.files.insert(file_name, metadata);
+            match self.files.entry(file_name.clone()) {
+                btree_map::Entry::Occupied(mut entry) => {
+                    if entry.get().content_hash != new_metadata.content_hash {
+                        let old_metadata = entry.insert(new_metadata.clone());
+                        Ok(Some(FileChange::Modified {
+                            old_meta: old_metadata,
+                            new_meta: new_metadata,
+                        }))
+                    } else {
+                        Ok(None)
+                    }
+                }
+                btree_map::Entry::Vacant(entry) => {
+                    entry.insert(new_metadata.clone());
+                    Ok(Some(FileChange::Created { meta: new_metadata }))
+                }
+            }
         } else {
-            self.files.remove(&file_name);
+            if let Some(old_metadata) = self.files.remove(&file_name) {
+                Ok(Some(FileChange::Removed {
+                    old_meta: old_metadata,
+                }))
+            } else {
+                bail!("Attempted to remove a file that doesn't exist in the current state")
+            }
         }
-
-        Ok(())
     }
 
-    pub fn refresh_paths(&mut self, root: &Path, paths: &[PathBuf]) -> Result<()> {
+    pub fn refresh_paths(
+        &mut self,
+        root: &Path,
+        paths: &[PathBuf],
+        content_store: &mut ContentStore,
+    ) -> Result<FsStateDiff> {
+        let mut diff = FsStateDiff {
+            files: BTreeMap::new(),
+        };
         for path in paths {
-            self.refresh_path(root, path)?;
+            if let Some(change) = self.refresh_path(root, path, content_store)? {
+                let file_name = FilePath(Arc::from(
+                    path.strip_prefix(root)?.to_string_lossy().as_ref(),
+                ));
+                diff.files.insert(file_name, change);
+            }
         }
-        Ok(())
+        Ok(diff)
     }
 
     pub fn diff(&self, next: &Self) -> FsStateDiff {
@@ -166,7 +202,7 @@ pub struct FsStateDiff {
 }
 
 #[derive(Debug, Clone)]
-enum FileChange {
+pub enum FileChange {
     Removed {
         old_meta: FileMetadata,
     },
@@ -261,7 +297,6 @@ impl ContentStore {
 
 pub struct Node {
     this_state: FsState,
-    last_transmitted_state: FsState,
     other_state: FsState,
     content_store: ContentStore,
     conflicts: Vec<PathBuf>,
@@ -271,7 +306,6 @@ impl Node {
     pub fn new(this_state: FsState, other_state: FsState, content_store: ContentStore) -> Self {
         Self {
             this_state,
-            last_transmitted_state: other_state.clone(),
             other_state,
             content_store,
             conflicts: Vec::new(),
@@ -279,9 +313,7 @@ impl Node {
     }
 
     pub fn changes_for_other(&mut self) -> FsStateDiff {
-        let diff = self.last_transmitted_state.diff(&self.this_state);
-        self.last_transmitted_state = self.this_state.clone();
-        diff
+        self.other_state.diff(&self.this_state)
     }
 
     pub fn changes_acked_by_other(&mut self, diff: &FsStateDiff) {
@@ -298,6 +330,11 @@ impl Node {
         self.conflicts.extend(conflicts);
         unconflicted_diff.apply(&mut self.this_state);
         Ok(())
+    }
+
+    pub fn refresh_paths(&mut self, root: &Path, paths: &[PathBuf]) -> Result<FsStateDiff> {
+        self.this_state
+            .refresh_paths(root, paths, &mut self.content_store)
     }
 
     pub fn has_conflicts(&self) -> bool {
@@ -434,7 +471,7 @@ mod tests {
         node1.changes_acked_by_other(&diff1);
 
         assert!(!node1.has_conflicts());
-        assert!(node1.is_settle());
+        assert_eq!(node1.this_state, node2.other_state);
         // Check if both nodes have the same state
         assert_eq!(node1.this_state, node2.this_state);
         assert_eq!(node1.other_state, node2.other_state);
