@@ -1,11 +1,12 @@
 // FIXME: protect against attacks
 // TODO: landlock support
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use iroh_blake3::Hash as ContentHash;
 use notify_debouncer_full::notify::{self, RecommendedWatcher, RecursiveMode, Watcher};
 use std::{
     collections::{btree_map, BTreeMap, HashMap},
+    io::ErrorKind,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -150,6 +151,7 @@ impl FsState {
         FsStateDiff { files }
     }
 
+    // Returns set of diff that you should apply to fs.
     pub fn check_diff(&self, diff: &FsStateDiff) -> (Vec<PathBuf>, FsStateDiff) {
         let mut conflicts = Vec::new();
         let mut unconflicted_diff = FsStateDiff {
@@ -234,13 +236,17 @@ impl FsStateDiff {
         }
     }
 
+    // this should be really exist on FsState so it can refresh the paths at same time
     pub fn apply_to_disk(&self, root: &Path, content_store: &ContentStore) -> Result<()> {
         for (file_name, change) in &self.files {
             let full_path = root.join(file_name.0.as_ref());
             match change {
-                FileChange::Removed { .. } => {
-                    std::fs::remove_file(&full_path)?;
-                }
+                FileChange::Removed { .. } => match std::fs::remove_file(&full_path) {
+                    Ok(()) => (),
+                    // already deleted
+                    Err(err) if err.kind() == ErrorKind::NotFound => {}
+                    Err(err) => bail!(err),
+                },
                 FileChange::Created { meta } => {
                     if let Some(parent) = full_path.parent() {
                         std::fs::create_dir_all(parent)?;
