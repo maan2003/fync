@@ -3,7 +3,6 @@ use clap::{Parser, Subcommand};
 use crossbeam_channel::{Receiver, RecvError, RecvTimeoutError};
 use fync::{watch_root, ContentStore, FsState, Node};
 use std::collections::BTreeSet;
-use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread::scope;
@@ -19,10 +18,6 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    Watch {
-        #[arg(default_value = ".")]
-        path: PathBuf,
-    },
     Sync {
         source: PathBuf,
         destination: PathBuf,
@@ -35,44 +30,10 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     match args.command {
-        Commands::Watch { path } => watch_command(path),
         Commands::Sync {
             source,
             destination,
         } => sync_command(source, destination),
-    }
-}
-
-#[instrument]
-fn watch_command(path: PathBuf) -> Result<()> {
-    let mut content_store = ContentStore::default();
-    let root = path.canonicalize().unwrap();
-    let initial_state = FsState::from_disk(&root, &mut content_store)?;
-    let node = Arc::new(Mutex::new(Node::new(initial_state.clone(), initial_state)));
-    let content_store = Arc::new(Mutex::new(content_store));
-
-    debug!("Initial node state: {:#?}", node);
-    let node_clone = Arc::clone(&node);
-    let root_clone = root.clone();
-    let content_store_clone = Arc::clone(&content_store);
-    let _watcher = watch_root(&root, move |paths| {
-        let mut node = node_clone.lock().unwrap();
-        let mut content_store = content_store_clone.lock().unwrap();
-        match node.refresh_paths(&root_clone, &paths, &mut content_store) {
-            Ok(diff) => {
-                if !diff.is_empty() {
-                    info!("Changes detected: {:#?}", diff);
-                }
-            }
-            Err(e) => error!("Error refreshing paths: {}", e),
-        }
-    })?;
-
-    info!("Press Ctrl+C to exit");
-
-    // Keep the main thread running
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(1));
     }
 }
 
@@ -103,9 +64,11 @@ fn sync_command(source: PathBuf, destination: PathBuf) -> Result<()> {
 
     {
         let mut dest_node = dest_node.lock().unwrap();
-        let unconflicted_diff = dest_node.apply_changes_from_other(&initial_source_diff)?;
-        // TODO: sync stores
-        unconflicted_diff.apply_to_disk(&destination, &content_store.lock().unwrap())?;
+        dest_node.apply_changes_from_other_to_disk(
+            &initial_source_diff,
+            &destination,
+            &mut content_store.lock().unwrap(),
+        )?;
         source_node
             .lock()
             .unwrap()
@@ -134,14 +97,14 @@ fn sync_command(source: PathBuf, destination: PathBuf) -> Result<()> {
                     Ok(diff) => {
                         if !diff.is_empty() {
                             debug!(?diff);
-                            match dest_node.apply_changes_from_other(&diff) {
-                                Ok(unconflicted_diff) => {
-                                    if let Err(e) = unconflicted_diff
-                                        .apply_to_disk(&destination, &content_store)
-                                    {
-                                        error!("Error applying changes to destination disk: {}", e);
-                                    }
-                                    source_node.changes_acked_by_other(&unconflicted_diff);
+                            match dest_node.apply_changes_from_other_to_disk(
+                                &diff,
+                                &source,
+                                content_store,
+                            ) {
+                                Ok(()) => {
+                                    // TODO: only unconflicted diff
+                                    source_node.changes_acked_by_other(&diff);
                                 }
                                 Err(e) => {
                                     error!("Error applying changes to destination: {}", e);
@@ -172,17 +135,16 @@ fn sync_command(source: PathBuf, destination: PathBuf) -> Result<()> {
                     Ok(diff) => {
                         if !diff.is_empty() {
                             debug!(?diff);
-                            match source_node.apply_changes_from_other(&diff) {
-                                Ok(unconflicted_diff) => {
-                                    if let Err(e) =
-                                        unconflicted_diff.apply_to_disk(&source, &content_store)
-                                    {
-                                        error!("Error applying changes to source disk: {}", e);
-                                    }
-                                    dest_node.changes_acked_by_other(&unconflicted_diff);
+                            match source_node.apply_changes_from_other_to_disk(
+                                &diff,
+                                &source,
+                                content_store,
+                            ) {
+                                Ok(()) => {
+                                    dest_node.changes_acked_by_other(&diff);
                                 }
                                 Err(e) => {
-                                    error!("Error applying changes to source: {}", e);
+                                    error!("Error applying changes to destination: {}", e);
                                 }
                             }
                         }

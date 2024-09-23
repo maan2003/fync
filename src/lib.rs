@@ -1,7 +1,8 @@
 // FIXME: protect against attacks
 // TODO: landlock support
+// TODO: think about atomically writting files
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use iroh_blake3::Hash as ContentHash;
 use notify_debouncer_full::notify::{self, RecommendedWatcher, RecursiveMode, Watcher};
 use std::{
@@ -12,6 +13,7 @@ use std::{
 };
 use tracing::error;
 
+/// A relative path to some root.
 #[derive(Debug, Eq, PartialOrd, Ord, PartialEq, Clone)]
 pub struct FilePath(Arc<str>);
 
@@ -25,19 +27,41 @@ pub struct FsState {
     files: BTreeMap<FilePath, FileMetadata>,
 }
 
+impl FilePath {
+    fn from_root_and_path(path: &Path, root: &Path) -> Result<FilePath> {
+        Ok(FilePath(Arc::from(
+            path.strip_prefix(root)?.to_string_lossy().as_ref(),
+        )))
+    }
+
+    fn to_absolute(&self, root: &Path) -> PathBuf {
+        root.join(self.0.as_ref())
+    }
+}
+
+impl FileMetadata {
+    fn from_fs(file: &Path, content_store: &mut ContentStore) -> Result<Option<Self>> {
+        match std::fs::read(file) {
+            Ok(content) => {
+                let content_hash = content_store.add(content);
+                Ok(Some(FileMetadata { content_hash }))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
 impl FsState {
     pub fn from_disk(root: &Path, content_store: &mut ContentStore) -> Result<Self> {
         let mut files = BTreeMap::new();
         for entry in ignore::Walk::new(root) {
             let entry = entry?;
             if entry.file_type().map_or(false, |d| d.is_file()) {
-                let path = entry.path();
-                let content_hash = content_store.add(std::fs::read(path)?);
-                let file_name = FilePath(Arc::from(
-                    path.strip_prefix(root)?.to_string_lossy().as_ref(),
-                ));
-                let metadata = FileMetadata { content_hash };
-                files.insert(file_name, metadata);
+                let file_path = FilePath::from_root_and_path(entry.path(), root)?;
+                if let Some(meta) = FileMetadata::from_fs(entry.path(), content_store)? {
+                    files.insert(file_path, meta);
+                }
             }
         }
         Ok(FsState { files })
@@ -46,46 +70,49 @@ impl FsState {
     pub fn refresh_path(
         &mut self,
         root: &Path,
-        file: &Path,
+        path: &Path,
         content_store: &mut ContentStore,
-    ) -> Result<Option<FileChange>> {
-        let relative_path = file.strip_prefix(root)?;
-        let file_name = FilePath(Arc::from(relative_path.to_string_lossy().as_ref()));
+    ) -> Result<Option<(FilePath, FileChange)>> {
+        let file_path = FilePath::from_root_and_path(path, root)?;
 
-        if file.is_file() {
-            let content = std::fs::read(file)?;
-            let content_hash = content_store.add(content);
-
-            let new_metadata = FileMetadata { content_hash };
-
-            match self.files.entry(file_name.clone()) {
+        let new_metadata = FileMetadata::from_fs(path, content_store);
+        if let Ok(Some(new_metadata)) = new_metadata {
+            match self.files.entry(file_path.clone()) {
                 btree_map::Entry::Occupied(mut entry) => {
                     if entry.get().content_hash != new_metadata.content_hash {
                         let old_metadata = entry.insert(new_metadata.clone());
-                        Ok(Some(FileChange::Modified {
-                            old_meta: old_metadata,
-                            new_meta: new_metadata,
-                        }))
+                        Ok(Some((
+                            file_path,
+                            FileChange::Modified {
+                                old_meta: old_metadata,
+                                new_meta: new_metadata,
+                            },
+                        )))
                     } else {
                         Ok(None)
                     }
                 }
                 btree_map::Entry::Vacant(entry) => {
                     entry.insert(new_metadata.clone());
-                    Ok(Some(FileChange::Created { meta: new_metadata }))
+                    Ok(Some((
+                        file_path,
+                        FileChange::Created { meta: new_metadata },
+                    )))
                 }
             }
-        }
-        // noop for directories
-        else if !file.exists() {
-            if let Some(old_metadata) = self.files.remove(&file_name) {
-                Ok(Some(FileChange::Removed {
-                    old_meta: old_metadata,
-                }))
+        } else if !path.exists() {
+            if let Some(old_metadata) = self.files.remove(&file_path) {
+                Ok(Some((
+                    file_path,
+                    FileChange::Removed {
+                        old_meta: old_metadata,
+                    },
+                )))
             } else {
                 Ok(None)
             }
         } else {
+            // noop for other file types
             Ok(None)
         }
     }
@@ -100,11 +127,8 @@ impl FsState {
             files: BTreeMap::new(),
         };
         for path in paths {
-            if let Some(change) = self.refresh_path(root, path, content_store)? {
-                let file_name = FilePath(Arc::from(
-                    path.strip_prefix(root)?.to_string_lossy().as_ref(),
-                ));
-                diff.files.insert(file_name, change);
+            if let Some((file_path, change)) = self.refresh_path(root, path, content_store)? {
+                diff.files.insert(file_path, change);
             }
         }
         Ok(diff)
@@ -151,49 +175,62 @@ impl FsState {
         FsStateDiff { files }
     }
 
-    // Returns set of diff that you should apply to fs.
-    pub fn check_diff(&self, diff: &FsStateDiff) -> (Vec<PathBuf>, FsStateDiff) {
+    // Returns the list conflicted paths
+    pub fn apply_diff(&mut self, diff: &FsStateDiff) -> Vec<FilePath> {
         let mut conflicts = Vec::new();
-        let mut unconflicted_diff = FsStateDiff {
-            files: BTreeMap::new(),
-        };
-
-        for (file_name, change) in &diff.files {
-            let is_conflict = match change {
-                FileChange::Removed { old_meta } => {
-                    if let Some(current_meta) = self.files.get(file_name) {
-                        current_meta.content_hash != old_meta.content_hash
-                    } else {
-                        false
-                    }
-                }
-                FileChange::Created { meta } => {
-                    if let Some(current_meta) = self.files.get(file_name) {
-                        current_meta.content_hash != meta.content_hash
-                    } else {
-                        false
-                    }
-                }
-                FileChange::Modified { old_meta, new_meta } => {
-                    if let Some(current_meta) = self.files.get(file_name) {
-                        current_meta.content_hash != old_meta.content_hash
-                            && current_meta.content_hash != new_meta.content_hash
-                    } else {
-                        true
-                    }
-                }
-            };
-
-            if is_conflict {
-                conflicts.push(PathBuf::from(file_name.0.as_ref()));
+        for (file_path, change) in &diff.files {
+            let current_status = self.files.get(file_path);
+            if change.conflicts(current_status) {
+                conflicts.push(file_path.clone());
             } else {
-                unconflicted_diff
-                    .files
-                    .insert(file_name.clone(), change.clone());
+                match change {
+                    FileChange::Removed { .. } => {
+                        self.files.remove(file_path);
+                    }
+                    FileChange::Created { meta } | FileChange::Modified { new_meta: meta, .. } => {
+                        self.files.insert(file_path.clone(), meta.clone());
+                    }
+                }
             }
         }
 
-        (conflicts, unconflicted_diff)
+        conflicts
+    }
+
+    pub fn apply_diff_to_disk(
+        &mut self,
+        diff: &FsStateDiff,
+        root: &Path,
+        content_store: &mut ContentStore,
+    ) -> Result<Vec<FilePath>> {
+        let mut conflicts = Vec::new();
+        for (file_path, change) in &diff.files {
+            let full_path = file_path.to_absolute(root);
+            let metadata = FileMetadata::from_fs(&full_path, content_store)?;
+            if change.conflicts(metadata.as_ref()) {
+                conflicts.push(file_path.clone());
+                continue;
+            }
+            match change {
+                FileChange::Removed { .. } => {
+                    if let Err(e) = std::fs::remove_file(&full_path) {
+                        if e.kind() != ErrorKind::NotFound {
+                            return Err(e.into());
+                        }
+                    }
+                    self.files.remove(file_path);
+                }
+                FileChange::Created { meta } | FileChange::Modified { new_meta: meta, .. } => {
+                    if let Some(parent) = full_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    let content = content_store.get(&meta.content_hash)?;
+                    std::fs::write(&full_path, content)?;
+                    self.files.insert(file_path.clone(), meta.clone());
+                }
+            }
+        }
+        Ok(conflicts)
     }
 }
 
@@ -217,52 +254,30 @@ pub enum FileChange {
     },
 }
 
+impl FileChange {
+    fn conflicts(&self, current_metadata: Option<&FileMetadata>) -> bool {
+        match (current_metadata, self) {
+            (Some(current_meta), FileChange::Removed { old_meta }) => {
+                current_meta.content_hash != old_meta.content_hash
+            }
+            (None, FileChange::Removed { .. }) => false,
+
+            (None, FileChange::Created { .. }) => false,
+            (Some(current_meta), FileChange::Created { meta }) => {
+                current_meta.content_hash != meta.content_hash
+            }
+
+            (Some(current_meta), FileChange::Modified { old_meta, new_meta }) => {
+                // Check if the current state differs from both old and new states
+                current_meta.content_hash != old_meta.content_hash
+                    && current_meta.content_hash != new_meta.content_hash
+            }
+            (None, FileChange::Modified { .. }) => true,
+        }
+    }
+}
+
 impl FsStateDiff {
-    pub fn apply(&self, state: &mut FsState) {
-        for (file_name, change) in &self.files {
-            match change {
-                FileChange::Removed { .. } => {
-                    state.files.remove(file_name);
-                }
-                FileChange::Created { meta } => {
-                    state.files.insert(file_name.clone(), meta.clone());
-                }
-                FileChange::Modified { new_meta, .. } => {
-                    if let Some(existing_meta) = state.files.get_mut(file_name) {
-                        *existing_meta = new_meta.clone();
-                    }
-                }
-            }
-        }
-    }
-
-    // this should be really exist on FsState so it can refresh the paths at same time
-    pub fn apply_to_disk(&self, root: &Path, content_store: &ContentStore) -> Result<()> {
-        for (file_name, change) in &self.files {
-            let full_path = root.join(file_name.0.as_ref());
-            match change {
-                FileChange::Removed { .. } => match std::fs::remove_file(&full_path) {
-                    Ok(()) => (),
-                    // already deleted
-                    Err(err) if err.kind() == ErrorKind::NotFound => {}
-                    Err(err) => bail!(err),
-                },
-                FileChange::Created { meta } => {
-                    if let Some(parent) = full_path.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    let content = content_store.get(&meta.content_hash)?;
-                    std::fs::write(&full_path, content)?;
-                }
-                FileChange::Modified { new_meta, .. } => {
-                    let content = content_store.get(&new_meta.content_hash)?;
-                    std::fs::write(&full_path, content)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
     pub fn is_empty(&self) -> bool {
         self.files.is_empty()
     }
@@ -305,7 +320,7 @@ impl ContentStore {
 pub struct Node {
     this_state: FsState,
     other_state: FsState,
-    conflicts: Vec<PathBuf>,
+    conflicts: Vec<FilePath>,
 }
 
 impl Node {
@@ -322,19 +337,32 @@ impl Node {
     }
 
     pub fn changes_acked_by_other(&mut self, diff: &FsStateDiff) {
-        let (conflicts, unconflicted_diff) = self.other_state.check_diff(diff);
+        let conflicts = self.other_state.apply_diff(diff);
         if !conflicts.is_empty() {
             error!("Unexpected conflicts in acked changes");
         }
-        unconflicted_diff.apply(&mut self.other_state);
     }
 
-    pub fn apply_changes_from_other(&mut self, diff: &FsStateDiff) -> Result<FsStateDiff> {
-        diff.apply(&mut self.other_state);
-        let (conflicts, unconflicted_diff) = self.this_state.check_diff(diff);
+    pub fn apply_changes_from_other_mem(&mut self, diff: &FsStateDiff) {
+        let conflicts = self.other_state.apply_diff(diff);
+        if !conflicts.is_empty() {
+            error!("Unexpected conflicts in other state");
+        }
+        let conflicts = self.this_state.apply_diff(diff);
         self.conflicts.extend(conflicts);
-        unconflicted_diff.apply(&mut self.this_state);
-        Ok(unconflicted_diff)
+    }
+
+    pub fn apply_changes_from_other_to_disk(
+        &mut self,
+        diff: &FsStateDiff,
+        root: &Path,
+        content_store: &mut ContentStore,
+    ) -> anyhow::Result<()> {
+        let conflicts = self
+            .this_state
+            .apply_diff_to_disk(diff, root, content_store)?;
+        self.conflicts.extend(conflicts);
+        Ok(())
     }
 
     pub fn refresh_paths(
@@ -433,7 +461,8 @@ mod tests {
         ));
 
         // Apply the diff to state1
-        diff.apply(&mut state1);
+        let conflicts = state1.apply_diff(&diff);
+        assert!(conflicts.is_empty());
 
         assert_eq!(state1, state2);
     }
@@ -461,7 +490,7 @@ mod tests {
 
         // Simulate changes on node1
         let diff1 = node1.changes_for_other();
-        node2.apply_changes_from_other(&diff1).unwrap();
+        node2.apply_changes_from_other_mem(&diff1);
 
         assert!(!node2.has_conflicts());
         assert!(node2.is_settle());
