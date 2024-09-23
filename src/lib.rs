@@ -29,16 +29,13 @@ pub struct FsState {
 }
 
 impl FsState {
-    pub fn from_disk(root: &Path) -> Result<Self> {
+    pub fn from_disk(root: &Path, content_store: &mut ContentStore) -> Result<Self> {
         let mut files = BTreeMap::new();
         for entry in ignore::Walk::new(root) {
             let entry = entry?;
             if entry.file_type().map_or(false, |d| d.is_file()) {
                 let path = entry.path();
-                let mut file = std::fs::File::open(path)?;
-                let mut hasher = iroh_blake3::Hasher::new();
-                std::io::copy(&mut file, &mut hasher)?;
-                let content_hash = hasher.finalize();
+                let content_hash = content_store.add(std::fs::read(path)?);
                 let file_name = FilePath(Arc::from(
                     path.strip_prefix(root)?.to_string_lossy().as_ref(),
                 ));
@@ -289,7 +286,7 @@ impl ContentStore {
     pub fn get(&self, hash: &ContentHash) -> Result<&[u8]> {
         self.contents
             .get(hash)
-            .ok_or_else(|| anyhow::anyhow!("Content not found in store"))
+            .ok_or_else(|| anyhow::anyhow!("Content not found in content store"))
             .map(|x| x.as_slice())
     }
 
@@ -306,16 +303,14 @@ impl ContentStore {
 pub struct Node {
     this_state: FsState,
     other_state: FsState,
-    content_store: ContentStore,
     conflicts: Vec<PathBuf>,
 }
 
 impl Node {
-    pub fn new(this_state: FsState, other_state: FsState, content_store: ContentStore) -> Self {
+    pub fn new(this_state: FsState, other_state: FsState) -> Self {
         Self {
             this_state,
             other_state,
-            content_store,
             conflicts: Vec::new(),
         }
     }
@@ -340,9 +335,13 @@ impl Node {
         Ok(())
     }
 
-    pub fn refresh_paths(&mut self, root: &Path, paths: &[PathBuf]) -> Result<FsStateDiff> {
-        self.this_state
-            .refresh_paths(root, paths, &mut self.content_store)
+    pub fn refresh_paths(
+        &mut self,
+        root: &Path,
+        paths: &[PathBuf],
+        content_store: &mut ContentStore,
+    ) -> Result<FsStateDiff> {
+        self.this_state.refresh_paths(root, paths, content_store)
     }
 
     pub fn has_conflicts(&self) -> bool {
@@ -351,10 +350,6 @@ impl Node {
 
     pub fn is_settle(&self) -> bool {
         self.this_state == self.other_state
-    }
-
-    pub fn content_store(&self) -> &ContentStore {
-        &self.content_store
     }
 }
 
@@ -446,13 +441,10 @@ mod tests {
 
     #[test]
     fn test_node() {
-        let mut cs1 = ContentStore::default();
-        let mut cs2 = ContentStore::default();
+        let mut cs = ContentStore::default();
 
-        let h1 = cs1.add(b"hello world".to_vec());
-        let h2 = cs1.add(b"bye world".to_vec());
-        cs2.add(b"hello world".to_vec());
-        cs2.add(b"bye world".to_vec());
+        let h1 = cs.add(b"hello world".to_vec());
+        let h2 = cs.add(b"bye world".to_vec());
 
         let mut state1 = FsState::empty();
         state1.insert_file("file1.txt", h1);
@@ -462,8 +454,8 @@ mod tests {
         state2.insert_file("file1.txt", h1);
         state2.insert_file("file3.txt", h2);
 
-        let mut node1 = Node::new(state1.clone(), state2.clone(), cs1);
-        let mut node2 = Node::new(state2.clone(), state1.clone(), cs2);
+        let mut node1 = Node::new(state1.clone(), state2.clone());
+        let mut node2 = Node::new(state2.clone(), state1.clone());
 
         assert!(!node1.is_settle());
         assert!(!node2.is_settle());
