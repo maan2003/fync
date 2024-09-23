@@ -1,8 +1,13 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use crossbeam_channel::{RecvError, RecvTimeoutError};
 use fync::{watch_root, ContentStore, FsState, Node};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::thread::scope;
+use std::time::Duration;
+use tracing::{debug, error, info, instrument, warn};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -23,7 +28,9 @@ enum Commands {
     },
 }
 
+#[instrument]
 fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
     let args = Args::parse();
 
     match args.command {
@@ -35,6 +42,7 @@ fn main() -> Result<()> {
     }
 }
 
+#[instrument]
 fn watch_command(path: PathBuf) -> Result<()> {
     let mut content_store = ContentStore::default();
     let root = path.canonicalize().unwrap();
@@ -42,7 +50,7 @@ fn watch_command(path: PathBuf) -> Result<()> {
     let node = Arc::new(Mutex::new(Node::new(initial_state.clone(), initial_state)));
     let content_store = Arc::new(Mutex::new(content_store));
 
-    eprintln!("node = {:#?}", node);
+    debug!("Initial node state: {:#?}", node);
     let node_clone = Arc::clone(&node);
     let root_clone = root.clone();
     let content_store_clone = Arc::clone(&content_store);
@@ -52,15 +60,14 @@ fn watch_command(path: PathBuf) -> Result<()> {
         match node.refresh_paths(&root_clone, &paths, &mut content_store) {
             Ok(diff) => {
                 if !diff.is_empty() {
-                    println!("Changes detected:");
-                    println!("{:#?}", diff);
+                    info!("Changes detected: {:#?}", diff);
                 }
             }
-            Err(e) => eprintln!("Error refreshing paths: {}", e),
+            Err(e) => error!("Error refreshing paths: {}", e),
         }
     })?;
 
-    println!("Press Ctrl+C to exit");
+    info!("Press Ctrl+C to exit");
 
     // Keep the main thread running
     loop {
@@ -68,6 +75,7 @@ fn watch_command(path: PathBuf) -> Result<()> {
     }
 }
 
+#[instrument]
 fn sync_command(source: PathBuf, destination: PathBuf) -> Result<()> {
     let source = source.canonicalize()?;
     let destination = destination.canonicalize()?;
@@ -89,80 +97,77 @@ fn sync_command(source: PathBuf, destination: PathBuf) -> Result<()> {
         let mut source_node = source_node.lock().unwrap();
         source_node.changes_for_other()
     };
-    println!("Initial sync from {:?} to {:?}:", source, destination);
-    println!("{:#?}", initial_source_diff);
+    info!("Initial sync started");
+    debug!(?initial_source_diff);
 
     {
         let mut dest_node = dest_node.lock().unwrap();
-        dest_node.apply_changes_from_other(&initial_source_diff)?;
+        let unconflicted_diff = dest_node.apply_changes_from_other(&initial_source_diff)?;
         // TODO: sync stores
-        initial_source_diff.apply_to_disk(&destination, &content_store.lock().unwrap())?;
+        unconflicted_diff.apply_to_disk(&destination, &content_store.lock().unwrap())?;
         source_node
             .lock()
             .unwrap()
             .changes_acked_by_other(&initial_source_diff);
     }
 
-    println!("Initial sync completed successfully");
+    info!("Initial sync completed successfully");
 
-    // Set up watchers for both directories
-    let source_clone = source.clone();
-    let dest_clone = destination.clone();
-    let source_node_clone = Arc::clone(&source_node);
-    let dest_node_clone = Arc::clone(&dest_node);
-    let content_store_clone = Arc::clone(&content_store);
-
-    let _source_watcher = watch_root(&source, move |paths| {
-        let mut source_node = source_node_clone.lock().unwrap();
-        let content_store = &mut content_store_clone.lock().unwrap();
-        match source_node.refresh_paths(&source_clone, &paths, content_store) {
-            Ok(diff) => {
-                if !diff.is_empty() {
-                    println!("Changes detected in source:");
-                    println!("{:#?}", diff);
-                    let mut dest_node = dest_node_clone.lock().unwrap();
-                    eprintln!("no dead lock - dest?");
-                    if let Err(e) = dest_node.apply_changes_from_other(&diff) {
-                        eprintln!("Error applying changes to destination: {}", e);
-                    }
-                    if let Err(e) = diff.apply_to_disk(&dest_clone, &content_store) {
-                        eprintln!("Error applying changes to destination disk: {}", e);
+    scope(|s| {
+        s.spawn(|| {
+            let (tx, rx) = crossbeam_channel::bounded(32);
+            let _watcher = watch_root(&source, move |paths| {
+                // FIXME: stop watching if other side dies.
+                let _ = tx.send(paths);
+            });
+            let mut is_disconnected = false;
+            while !is_disconnected {
+                let mut paths = BTreeSet::new();
+                match rx.recv() {
+                    Ok(path_list) => paths.extend(path_list),
+                    Err(RecvError) => break,
+                }
+                let debounce_deadline = std::time::Instant::now() + Duration::from_millis(10);
+                loop {
+                    match rx.recv_deadline(debounce_deadline) {
+                        Ok(path_list) => paths.extend(path_list),
+                        Err(RecvTimeoutError::Timeout) => break,
+                        Err(RecvTimeoutError::Disconnected) => {
+                            is_disconnected = true;
+                            break;
+                        }
                     }
                 }
-            }
-            Err(e) => eprintln!("Error refreshing source paths: {}", e),
-        }
-    })?;
-
-    let source_clone = source.clone();
-    let dest_clone = destination.clone();
-    let source_node_clone = Arc::clone(&source_node);
-    let dest_node_clone = Arc::clone(&dest_node);
-    let content_store_clone = Arc::clone(&content_store);
-
-    let _dest_watcher = watch_root(&destination, move |paths| {
-        let mut dest_node = dest_node_clone.lock().unwrap();
-        let content_store = &mut content_store_clone.lock().unwrap();
-        match dest_node.refresh_paths(&dest_clone, &paths, content_store) {
-            Ok(diff) => {
-                if !diff.is_empty() {
-                    println!("Changes detected in destination:");
-                    println!("{:#?}", diff);
-                    let mut source_node = source_node_clone.lock().unwrap();
-                    if let Err(e) = source_node.apply_changes_from_other(&diff) {
-                        eprintln!("Error applying changes to source: {}", e);
+                let paths = paths.into_iter().collect::<Vec<_>>();
+                let mut source_node = source_node.lock().unwrap();
+                let mut dest_node = dest_node.lock().unwrap();
+                let content_store = &mut content_store.lock().unwrap();
+                info!(?paths, "Changes detected in source");
+                match source_node.refresh_paths(&source, &paths, content_store) {
+                    Ok(diff) => {
+                        if !diff.is_empty() {
+                            debug!(?diff);
+                            match dest_node.apply_changes_from_other(&diff) {
+                                Ok(unconflicted_diff) => {
+                                    if let Err(e) = unconflicted_diff
+                                        .apply_to_disk(&destination, &content_store)
+                                    {
+                                        error!("Error applying changes to destination disk: {}", e);
+                                    }
+                                    source_node.changes_acked_by_other(&unconflicted_diff);
+                                }
+                                Err(e) => {
+                                    error!("Error applying changes to destination: {}", e);
+                                }
+                            }
+                        }
                     }
-                    if let Err(e) = diff.apply_to_disk(&source_clone, content_store) {
-                        eprintln!("Error applying changes to source disk: {}", e);
-                    }
-                    eprintln!("Applied Changes to Src");
+                    Err(e) => error!("Error refreshing source paths: {}", e),
                 }
             }
-            Err(e) => eprintln!("Error refreshing destination paths: {}", e),
-        }
-    })?;
-
-    println!("Watching for changes. Press Ctrl+C to exit.");
+        });
+    });
+    info!("Watching for changes. Press Ctrl+C to exit.");
 
     // Keep the main thread running
     loop {

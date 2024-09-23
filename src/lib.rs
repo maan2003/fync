@@ -1,19 +1,15 @@
 // FIXME: protect against attacks
 // TODO: landlock support
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use iroh_blake3::Hash as ContentHash;
-use notify_debouncer_full::{
-    new_debouncer,
-    notify::{RecommendedWatcher, RecursiveMode, Watcher},
-    DebouncedEvent, Debouncer, FileIdMap,
-};
+use notify_debouncer_full::notify::{self, RecommendedWatcher, RecursiveMode, Watcher};
 use std::{
     collections::{btree_map, BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
 };
+use tracing::error;
 
 #[derive(Debug, Eq, PartialOrd, Ord, PartialEq, Clone)]
 pub struct FilePath(Arc<str>);
@@ -86,7 +82,7 @@ impl FsState {
                     old_meta: old_metadata,
                 }))
             } else {
-                bail!("Attempted to remove a file that doesn't exist in the current state")
+                Ok(None)
             }
         } else {
             Ok(None)
@@ -322,17 +318,17 @@ impl Node {
     pub fn changes_acked_by_other(&mut self, diff: &FsStateDiff) {
         let (conflicts, unconflicted_diff) = self.other_state.check_diff(diff);
         if !conflicts.is_empty() {
-            eprintln!("Warning: Unexpected conflicts in acked changes");
+            error!("Unexpected conflicts in acked changes");
         }
         unconflicted_diff.apply(&mut self.other_state);
     }
 
-    pub fn apply_changes_from_other(&mut self, diff: &FsStateDiff) -> Result<()> {
+    pub fn apply_changes_from_other(&mut self, diff: &FsStateDiff) -> Result<FsStateDiff> {
         diff.apply(&mut self.other_state);
         let (conflicts, unconflicted_diff) = self.this_state.check_diff(diff);
         self.conflicts.extend(conflicts);
         unconflicted_diff.apply(&mut self.this_state);
-        Ok(())
+        Ok(unconflicted_diff)
     }
 
     pub fn refresh_paths(
@@ -358,25 +354,23 @@ impl Node {
 pub fn watch_root(
     root: &Path,
     handler: impl Fn(Vec<PathBuf>) + Send + 'static,
-) -> Result<Debouncer<RecommendedWatcher, FileIdMap>> {
-    let mut debouncer = new_debouncer(
-        Duration::from_millis(10),
-        None,
-        move |result: Result<Vec<DebouncedEvent>, _>| match result {
-            Ok(events) => handler(
-                events
-                    .into_iter()
-                    .flat_map(|mut x| std::mem::take(&mut x.paths))
-                    .collect(),
-            ),
-            Err(e) => eprintln!("Error in file watcher: {:?}", e),
+) -> Result<RecommendedWatcher> {
+    // TODO: debounce
+    let mut watcher = notify::RecommendedWatcher::new(
+        move |result: Result<notify::Event, _>| {
+            let Ok(event) = result else {
+                error!("Error in file watcher");
+                return;
+            };
+            handler(event.paths);
         },
+        Default::default(),
     )?;
 
     // TODO: check how this interacts with new directories
     // FIXME: this wasted effort by walking the tree *once again*
-    debouncer.watcher().watch(root, RecursiveMode::Recursive)?;
-    Ok(debouncer)
+    watcher.watch(root, RecursiveMode::Recursive)?;
+    Ok(watcher)
 }
 
 #[cfg(test)]
