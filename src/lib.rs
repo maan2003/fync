@@ -78,7 +78,9 @@ impl FsState {
                     Ok(Some(FileChange::Created { meta: new_metadata }))
                 }
             }
-        } else {
+        }
+        // noop for directories
+        else if !file.exists() {
             if let Some(old_metadata) = self.files.remove(&file_name) {
                 Ok(Some(FileChange::Removed {
                     old_meta: old_metadata,
@@ -86,6 +88,8 @@ impl FsState {
             } else {
                 bail!("Attempted to remove a file that doesn't exist in the current state")
             }
+        } else {
+            Ok(None)
         }
     }
 
@@ -352,6 +356,7 @@ impl Node {
 }
 
 // TODO: don't watch git ignored paths
+// so we get git ignored files in diffs :/
 pub fn watch_root(
     root: &Path,
     handler: impl Fn(Vec<PathBuf>) + Send + 'static,
