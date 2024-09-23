@@ -3,7 +3,7 @@ use iroh_blake3::Hash as ContentHash;
 use notify_debouncer_full::{
     new_debouncer,
     notify::{RecommendedWatcher, RecursiveMode, Watcher},
-    DebouncedEvent, Debouncer, FileIdCache,
+    DebouncedEvent, Debouncer, FileIdMap,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -36,14 +36,10 @@ impl FsState {
                 let mut hasher = iroh_blake3::Hasher::new();
                 std::io::copy(&mut file, &mut hasher)?;
                 let content_hash = hasher.finalize();
-                let mtime = entry.metadata()?.modified()?;
                 let file_name = FilePath(Arc::from(
                     path.strip_prefix(root)?.to_string_lossy().as_ref(),
                 ));
-                let metadata = FileMetadata {
-                    content_hash,
-                    // mtime,
-                };
+                let metadata = FileMetadata { content_hash };
                 files.insert(file_name, metadata);
             }
         }
@@ -118,36 +114,48 @@ impl FsState {
         FsStateDiff { files }
     }
 
-    pub fn check_diff(&self, diff: &FsStateDiff) -> bool {
+    pub fn check_diff(&self, diff: &FsStateDiff) -> (Vec<PathBuf>, FsStateDiff) {
+        let mut conflicts = Vec::new();
+        let mut unconflicted_diff = FsStateDiff {
+            files: BTreeMap::new(),
+        };
+
         for (file_name, change) in &diff.files {
-            match change {
+            let is_conflict = match change {
                 FileChange::Removed { old_meta } => {
                     if let Some(current_meta) = self.files.get(file_name) {
-                        if current_meta.content_hash != old_meta.content_hash {
-                            return false;
-                        }
+                        current_meta.content_hash != old_meta.content_hash
                     } else {
-                        return false;
+                        false
                     }
                 }
-                FileChange::Created { .. } => {
-                    if self.files.contains_key(file_name) {
-                        return false;
-                    }
-                }
-                FileChange::Modified { old_meta, .. } => {
+                FileChange::Created { meta } => {
                     if let Some(current_meta) = self.files.get(file_name) {
-                        if current_meta.content_hash != old_meta.content_hash {
-                            return false;
-                        }
-                        // TODO: check mtime
+                        current_meta.content_hash != meta.content_hash
                     } else {
-                        return false;
+                        false
                     }
                 }
+                FileChange::Modified { old_meta, new_meta } => {
+                    if let Some(current_meta) = self.files.get(file_name) {
+                        current_meta.content_hash != old_meta.content_hash
+                            && current_meta.content_hash != new_meta.content_hash
+                    } else {
+                        true
+                    }
+                }
+            };
+
+            if is_conflict {
+                conflicts.push(PathBuf::from(file_name.0.as_ref()));
+            } else {
+                unconflicted_diff
+                    .files
+                    .insert(file_name.clone(), change.clone());
             }
         }
-        true
+
+        (conflicts, unconflicted_diff)
     }
 }
 
@@ -157,7 +165,7 @@ pub struct FsStateDiff {
     files: BTreeMap<FilePath, FileChange>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum FileChange {
     Removed {
         old_meta: FileMetadata,
@@ -253,46 +261,73 @@ impl ContentStore {
 
 pub struct Node {
     this_state: FsState,
+    last_transmitted_state: FsState,
     other_state: FsState,
     content_store: ContentStore,
+    conflicts: Vec<PathBuf>,
 }
 
 impl Node {
-    pub fn changes_for_other(&self) -> FsStateDiff {
-        self.other_state.diff(&self.this_state)
+    pub fn new(this_state: FsState, other_state: FsState, content_store: ContentStore) -> Self {
+        Self {
+            this_state,
+            last_transmitted_state: other_state.clone(),
+            other_state,
+            content_store,
+            conflicts: Vec::new(),
+        }
+    }
+
+    pub fn changes_for_other(&mut self) -> FsStateDiff {
+        let diff = self.last_transmitted_state.diff(&self.this_state);
+        self.last_transmitted_state = self.this_state.clone();
+        diff
     }
 
     pub fn changes_acked_by_other(&mut self, diff: &FsStateDiff) {
-        debug_assert!(self.other_state.check_diff(diff));
-        diff.apply(&mut self.other_state);
+        let (conflicts, unconflicted_diff) = self.other_state.check_diff(diff);
+        if !conflicts.is_empty() {
+            eprintln!("Warning: Unexpected conflicts in acked changes");
+        }
+        unconflicted_diff.apply(&mut self.other_state);
     }
 
     pub fn apply_changes_from_other(&mut self, diff: &FsStateDiff) -> Result<()> {
         diff.apply(&mut self.other_state);
-        if self.this_state.check_diff(diff) {
-            diff.apply(&mut self.this_state);
-        } else {
-            // TODO: fix later, only stop syncing for conflicted paths
-            panic!("conflicts found, exiting");
-        }
+        let (conflicts, unconflicted_diff) = self.this_state.check_diff(diff);
+        self.conflicts.extend(conflicts);
+        unconflicted_diff.apply(&mut self.this_state);
         Ok(())
+    }
+
+    pub fn has_conflicts(&self) -> bool {
+        !self.conflicts.is_empty()
     }
 
     pub fn is_settle(&self) -> bool {
         self.this_state == self.other_state
+    }
+
+    pub fn content_store(&self) -> &ContentStore {
+        &self.content_store
     }
 }
 
 // TODO: don't watch git ignored paths
 pub fn watch_root(
     root: &Path,
-    handler: Fn(Vec<PathBuf>),
-) -> Result<Debouncer<RecommendedWatcher, FileIdCache>> {
+    handler: impl Fn(Vec<PathBuf>) + Send + 'static,
+) -> Result<Debouncer<RecommendedWatcher, FileIdMap>> {
     let mut debouncer = new_debouncer(
         Duration::from_millis(10),
         None,
         move |result: Result<Vec<DebouncedEvent>, _>| match result {
-            Ok(events) => handler(events.into_iter().flat_map(|x| x.paths).collect()),
+            Ok(events) => handler(
+                events
+                    .into_iter()
+                    .flat_map(|mut x| std::mem::take(&mut x.paths))
+                    .collect(),
+            ),
             Err(e) => eprintln!("Error in file watcher: {:?}", e),
         },
     )?;
@@ -370,8 +405,8 @@ mod tests {
 
         let h1 = cs1.add(b"hello world".to_vec());
         let h2 = cs1.add(b"bye world".to_vec());
-        cs2.insert(h1, b"hello world".to_vec());
-        cs2.insert(h2, b"bye world".to_vec());
+        cs2.add(b"hello world".to_vec());
+        cs2.add(b"bye world".to_vec());
 
         let mut state1 = FsState::empty();
         state1.insert_file("file1.txt", h1);
@@ -381,17 +416,8 @@ mod tests {
         state2.insert_file("file1.txt", h1);
         state2.insert_file("file3.txt", h2);
 
-        let mut node1 = Node {
-            this_state: state1.clone(),
-            other_state: state2.clone(),
-            content_store: cs1,
-        };
-
-        let mut node2 = Node {
-            this_state: state2.clone(),
-            other_state: state1.clone(),
-            content_store: cs2,
-        };
+        let mut node1 = Node::new(state1.clone(), state2.clone(), cs1);
+        let mut node2 = Node::new(state2.clone(), state1.clone(), cs2);
 
         assert!(!node1.is_settle());
         assert!(!node2.is_settle());
@@ -400,12 +426,14 @@ mod tests {
         let diff1 = node1.changes_for_other();
         node2.apply_changes_from_other(&diff1).unwrap();
 
+        assert!(!node2.has_conflicts());
         assert!(node2.is_settle());
 
         assert!(!node1.is_settle());
         // Simulate changes on node2
         node1.changes_acked_by_other(&diff1);
 
+        assert!(!node1.has_conflicts());
         assert!(node1.is_settle());
         // Check if both nodes have the same state
         assert_eq!(node1.this_state, node2.this_state);
