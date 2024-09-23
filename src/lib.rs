@@ -355,7 +355,6 @@ pub fn watch_root(
     root: &Path,
     handler: impl Fn(Vec<PathBuf>) + Send + 'static,
 ) -> Result<RecommendedWatcher> {
-    // TODO: debounce
     let mut watcher = notify::RecommendedWatcher::new(
         move |result: Result<notify::Event, _>| {
             let Ok(event) = result else {

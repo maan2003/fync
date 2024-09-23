@@ -1,12 +1,13 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use crossbeam_channel::{RecvError, RecvTimeoutError};
+use crossbeam_channel::{Receiver, RecvError, RecvTimeoutError};
 use fync::{watch_root, ContentStore, FsState, Node};
 use std::collections::BTreeSet;
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread::scope;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, instrument, warn};
 
 #[derive(Parser, Debug)]
@@ -120,25 +121,11 @@ fn sync_command(source: PathBuf, destination: PathBuf) -> Result<()> {
                 // FIXME: stop watching if other side dies.
                 let _ = tx.send(paths);
             });
-            let mut is_disconnected = false;
-            while !is_disconnected {
-                let mut paths = BTreeSet::new();
-                match rx.recv() {
-                    Ok(path_list) => paths.extend(path_list),
+            loop {
+                let paths = match debounce_watcher(&rx) {
+                    Ok(paths) => paths,
                     Err(RecvError) => break,
-                }
-                let debounce_deadline = std::time::Instant::now() + Duration::from_millis(10);
-                loop {
-                    match rx.recv_deadline(debounce_deadline) {
-                        Ok(path_list) => paths.extend(path_list),
-                        Err(RecvTimeoutError::Timeout) => break,
-                        Err(RecvTimeoutError::Disconnected) => {
-                            is_disconnected = true;
-                            break;
-                        }
-                    }
-                }
-                let paths = paths.into_iter().collect::<Vec<_>>();
+                };
                 let mut source_node = source_node.lock().unwrap();
                 let mut dest_node = dest_node.lock().unwrap();
                 let content_store = &mut content_store.lock().unwrap();
@@ -166,6 +153,44 @@ fn sync_command(source: PathBuf, destination: PathBuf) -> Result<()> {
                 }
             }
         });
+        s.spawn(|| {
+            let (tx, rx) = crossbeam_channel::bounded(32);
+            let _watcher = watch_root(&destination, move |paths| {
+                // FIXME: stop watching if other side dies.
+                let _ = tx.send(paths);
+            });
+            loop {
+                let paths = match debounce_watcher(&rx) {
+                    Ok(paths) => paths,
+                    Err(RecvError) => break,
+                };
+                let mut source_node = source_node.lock().unwrap();
+                let mut dest_node = dest_node.lock().unwrap();
+                let content_store = &mut content_store.lock().unwrap();
+                info!(?paths, "Changes detected in destination");
+                match dest_node.refresh_paths(&destination, &paths, content_store) {
+                    Ok(diff) => {
+                        if !diff.is_empty() {
+                            debug!(?diff);
+                            match source_node.apply_changes_from_other(&diff) {
+                                Ok(unconflicted_diff) => {
+                                    if let Err(e) =
+                                        unconflicted_diff.apply_to_disk(&source, &content_store)
+                                    {
+                                        error!("Error applying changes to source disk: {}", e);
+                                    }
+                                    dest_node.changes_acked_by_other(&unconflicted_diff);
+                                }
+                                Err(e) => {
+                                    error!("Error applying changes to source: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => error!("Error refreshing destination paths: {}", e),
+                }
+            }
+        });
     });
     info!("Watching for changes. Press Ctrl+C to exit.");
 
@@ -173,4 +198,24 @@ fn sync_command(source: PathBuf, destination: PathBuf) -> Result<()> {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
+}
+
+fn debounce_watcher(rx: &Receiver<Vec<PathBuf>>) -> Result<Vec<PathBuf>, RecvError> {
+    let mut paths = BTreeSet::new();
+    let path_list = rx.recv()?;
+    paths.extend(path_list);
+    let debounce_deadline = Instant::now() + Duration::from_millis(10);
+    loop {
+        match rx.recv_deadline(debounce_deadline) {
+            Ok(path_list) => paths.extend(path_list),
+            Err(RecvTimeoutError::Timeout) => break,
+            Err(RecvTimeoutError::Disconnected) => {
+                if paths.is_empty() {
+                    return Err(RecvError);
+                }
+                break;
+            }
+        }
+    }
+    Ok(paths.into_iter().collect())
 }
