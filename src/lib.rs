@@ -1,3 +1,5 @@
+// FIXME: protect against attacks
+
 use anyhow::{bail, Result};
 use iroh_blake3::Hash as ContentHash;
 use notify_debouncer_full::{
