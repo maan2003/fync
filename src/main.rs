@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use crossbeam_channel::{Receiver, RecvError, RecvTimeoutError};
-use fync::{watch_root, ContentStore, FsState, Node};
+use crossbeam_channel::{Receiver, RecvError, RecvTimeoutError, Sender};
+use fync::{watch_root, watch_root_fanotify, ContentStore, FsState, Node, NodeMessage};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -15,12 +15,14 @@ struct Args {
     #[command(subcommand)]
     command: Commands,
 }
-
 #[derive(Subcommand, Debug)]
 enum Commands {
     Sync {
         source: PathBuf,
         destination: PathBuf,
+    },
+    Watch {
+        directory: PathBuf,
     },
 }
 
@@ -34,10 +36,32 @@ fn main() -> Result<()> {
             source,
             destination,
         } => sync_command(source, destination),
+        Commands::Watch { directory } => watch_command(directory),
     }
 }
 
-#[instrument]
+fn watch_command(directory: PathBuf) -> Result<()> {
+    let (watch_tx, watch_rx) = crossbeam_channel::bounded(32);
+    let _watcher = watch_root_fanotify(&directory, move |paths| {
+        let _ = watch_tx.send(paths);
+    });
+    dbg!(_watcher);
+
+    loop {
+        match debounce_watcher(watch_rx.recv()?, &watch_rx) {
+            Ok(paths) => {
+                println!("Changes detected:");
+                for path in paths {
+                    println!("  {:?}", path);
+                }
+            }
+            Err(RecvError) => break,
+        }
+    }
+
+    Ok(())
+}
+
 fn sync_command(source: PathBuf, destination: PathBuf) -> Result<()> {
     let source = source.canonicalize()?;
     let destination = destination.canonicalize()?;
@@ -48,113 +72,46 @@ fn sync_command(source: PathBuf, destination: PathBuf) -> Result<()> {
 
     let content_store = Arc::new(Mutex::new(content_store));
 
-    let source_node = Arc::new(Mutex::new(Node::new(
-        source_state.clone(),
-        dest_state.clone(),
-    )));
-    let dest_node = Arc::new(Mutex::new(Node::new(dest_state, source_state)));
+    let mut source_node = Node::new(source_state.clone(), dest_state.clone());
+    let mut dest_node = Node::new(dest_state, source_state);
 
     // Initial sync
-    let initial_source_diff = {
-        let mut source_node = source_node.lock().unwrap();
-        source_node.changes_for_other()
-    };
+    let initial_source_diff = source_node.changes_for_other();
     info!("Initial sync started");
     debug!(?initial_source_diff);
 
-    {
-        let mut dest_node = dest_node.lock().unwrap();
-        dest_node.apply_changes_from_other_to_disk(
-            &initial_source_diff,
-            &destination,
-            &mut content_store.lock().unwrap(),
-        )?;
-        source_node
-            .lock()
-            .unwrap()
-            .changes_acked_by_other(&initial_source_diff);
-    }
+    dest_node.apply_changes_from_other_to_disk(
+        &initial_source_diff,
+        &destination,
+        &mut content_store.lock().unwrap(),
+    )?;
+    source_node.changes_acked_by_other(&initial_source_diff);
 
     info!("Initial sync completed successfully");
 
+    let (dest_out, source_in) = crossbeam_channel::bounded::<NodeMessage>(32);
+    let (source_out, dest_in) = crossbeam_channel::bounded::<NodeMessage>(32);
     scope(|s| {
         s.spawn(|| {
-            let (tx, rx) = crossbeam_channel::bounded(32);
-            let _watcher = watch_root(&source, move |paths| {
-                // FIXME: stop watching if other side dies.
-                let _ = tx.send(paths);
-            });
-            loop {
-                let paths = match debounce_watcher(&rx) {
-                    Ok(paths) => paths,
-                    Err(RecvError) => break,
-                };
-                let mut source_node = source_node.lock().unwrap();
-                let mut dest_node = dest_node.lock().unwrap();
-                let content_store = &mut content_store.lock().unwrap();
-                info!(?paths, "Changes detected in source");
-                match source_node.refresh_paths(&source, &paths, content_store) {
-                    Ok(diff) => {
-                        if !diff.is_empty() {
-                            debug!(?diff);
-                            match dest_node.apply_changes_from_other_to_disk(
-                                &diff,
-                                &source,
-                                content_store,
-                            ) {
-                                Ok(()) => {
-                                    // TODO: only unconflicted diff
-                                    source_node.changes_acked_by_other(&diff);
-                                }
-                                Err(e) => {
-                                    error!("Error applying changes to destination: {}", e);
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => error!("Error refreshing source paths: {}", e),
-                }
-            }
+            run_node(
+                source_node,
+                source,
+                source_in,
+                source_out,
+                content_store.clone(),
+            )
         });
         s.spawn(|| {
-            let (tx, rx) = crossbeam_channel::bounded(32);
-            let _watcher = watch_root(&destination, move |paths| {
-                // FIXME: stop watching if other side dies.
-                let _ = tx.send(paths);
-            });
-            loop {
-                let paths = match debounce_watcher(&rx) {
-                    Ok(paths) => paths,
-                    Err(RecvError) => break,
-                };
-                let mut source_node = source_node.lock().unwrap();
-                let mut dest_node = dest_node.lock().unwrap();
-                let content_store = &mut content_store.lock().unwrap();
-                info!(?paths, "Changes detected in destination");
-                match dest_node.refresh_paths(&destination, &paths, content_store) {
-                    Ok(diff) => {
-                        if !diff.is_empty() {
-                            debug!(?diff);
-                            match source_node.apply_changes_from_other_to_disk(
-                                &diff,
-                                &source,
-                                content_store,
-                            ) {
-                                Ok(()) => {
-                                    dest_node.changes_acked_by_other(&diff);
-                                }
-                                Err(e) => {
-                                    error!("Error applying changes to destination: {}", e);
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => error!("Error refreshing destination paths: {}", e),
-                }
-            }
+            run_node(
+                dest_node,
+                destination,
+                dest_in,
+                dest_out,
+                content_store.clone(),
+            )
         });
+        info!("Watching for changes. Press Ctrl+C to exit.");
     });
-    info!("Watching for changes. Press Ctrl+C to exit.");
 
     // Keep the main thread running
     loop {
@@ -162,14 +119,69 @@ fn sync_command(source: PathBuf, destination: PathBuf) -> Result<()> {
     }
 }
 
-fn debounce_watcher(rx: &Receiver<Vec<PathBuf>>) -> Result<Vec<PathBuf>, RecvError> {
+#[instrument(skip_all, fields(?root), err, ret)]
+fn run_node(
+    mut node: Node,
+    root: PathBuf,
+    input: Receiver<NodeMessage>,
+    output: Sender<NodeMessage>,
+    content_store: Arc<Mutex<ContentStore>>,
+) -> std::result::Result<(), anyhow::Error> {
+    let (watch_tx, watch_rx) = crossbeam_channel::bounded(32);
+    let _watcher = watch_root(&root, move |paths| {
+        // FIXME: stop watching if other side dies.
+        let _ = watch_tx.send(paths);
+    });
+    loop {
+        #[derive(Debug)]
+        enum Event {
+            Message(NodeMessage),
+            Refresh(Vec<PathBuf>),
+        }
+        let event = crossbeam_channel::select! {
+            recv(input) -> msg => {
+                if let Ok(msg) = msg {
+                    Event::Message(msg)
+                } else {
+                    break;
+                }
+            }
+            recv(watch_rx) -> path_list => {
+                match debounce_watcher(path_list?, &watch_rx) {
+                    Ok(paths) => Event::Refresh(paths),
+                    Err(RecvError) => break,
+                }
+            }
+        };
+        info!(?event, "processing event");
+        let response = match event {
+            Event::Message(msg) => {
+                node.handle_message_disk(msg, &root, &mut content_store.lock().unwrap())?
+            }
+            Event::Refresh(path_list) => {
+                node.refresh_paths(&root, &path_list, &mut content_store.lock().unwrap())?
+            }
+        };
+        if let Some(response) = response {
+            output.send(response)?;
+        }
+    }
+    anyhow::Ok(())
+}
+
+fn debounce_watcher(
+    path_list: Vec<PathBuf>,
+    rx: &Receiver<Vec<PathBuf>>,
+) -> Result<Vec<PathBuf>, RecvError> {
     let mut paths = BTreeSet::new();
-    let path_list = rx.recv()?;
     paths.extend(path_list);
-    let debounce_deadline = Instant::now() + Duration::from_millis(10);
+    let debounce_deadline = Instant::now() + Duration::from_millis(20);
     loop {
         match rx.recv_deadline(debounce_deadline) {
-            Ok(path_list) => paths.extend(path_list),
+            Ok(path_list) => {
+                info!(?path_list, "more events");
+                paths.extend(path_list)
+            }
             Err(RecvTimeoutError::Timeout) => break,
             Err(RecvTimeoutError::Disconnected) => {
                 if paths.is_empty() {
@@ -179,5 +191,6 @@ fn debounce_watcher(rx: &Receiver<Vec<PathBuf>>) -> Result<Vec<PathBuf>, RecvErr
             }
         }
     }
+    info!(?paths, "refreshing");
     Ok(paths.into_iter().collect())
 }

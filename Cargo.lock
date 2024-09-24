@@ -110,7 +110,7 @@ checksum = "8d82cb332cdfaed17ae235a638438ac4d4839913cc2af585c3c6746e8f8bee1a"
 dependencies = [
  "addr2line",
  "cfg-if",
- "libc",
+ "libc 0.2.158",
  "miniz_oxide",
  "object",
  "rustc-demangle",
@@ -136,6 +136,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40723b8fb387abc38f4f4a37c09073622e41dd12327033091ef8950659e6dc0c"
 dependencies = [
  "memchr",
+ "regex-automata",
  "serde",
 ]
 
@@ -153,6 +154,12 @@ name = "cfg-if"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
+
+[[package]]
+name = "cfg_aliases"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "clap"
@@ -241,13 +248,43 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22ec99545bb0ed0ea7bb9b8e1e9122ea386ff8a48c0922e43f36d45ab09e0e80"
 
 [[package]]
+name = "enum-iterator"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9fd242f399be1da0a5354aa462d57b4ab2b4ee0683cc552f7c007d2d12d36e94"
+dependencies = [
+ "enum-iterator-derive",
+]
+
+[[package]]
+name = "enum-iterator-derive"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1ab991c1362ac86c61ab6f556cff143daa22e5a15e4e189df818b2fd19fe65b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "errno"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "534c5cf6194dfab3db3242765c03bbe257cf92f22b38f6bc0c58d59108a820ba"
 dependencies = [
- "libc",
+ "libc 0.2.158",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "fanotify-rs"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9525f3fd6f3ae518fdc1642663a93a7c8155e863699d203303b22c45ebbbfe8"
+dependencies = [
+ "enum-iterator",
+ "libc 0.2.158",
 ]
 
 [[package]]
@@ -272,7 +309,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "35c0522e981e68cbfa8c3f978441a5f34b30b96e146b33cd3359176b50fe8586"
 dependencies = [
  "cfg-if",
- "libc",
+ "libc 0.2.158",
  "libredox",
  "windows-sys 0.59.0",
 ]
@@ -283,7 +320,7 @@ version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76ee7a02da4d231650c7cea31349b889be2f45ddb3ef3032d2ec8185f6313fd2"
 dependencies = [
- "libc",
+ "libc 0.2.158",
 ]
 
 [[package]]
@@ -291,10 +328,14 @@ name = "fync"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bstr",
  "clap",
  "crossbeam-channel",
+ "fanotify-rs",
  "ignore",
  "iroh-blake3",
+ "libc 0.2.151",
+ "nix",
  "notify-debouncer-full",
  "tempfile",
  "tokio",
@@ -352,7 +393,7 @@ checksum = "f8069d3ec154eb856955c1c0fbffefbf5f3c40a104ec912d4797314c1801abff"
 dependencies = [
  "bitflags 1.3.2",
  "inotify-sys",
- "libc",
+ "libc 0.2.158",
 ]
 
 [[package]]
@@ -361,7 +402,7 @@ version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e05c02b5e89bff3b946cedeca278abc628fe811e604f027c45a8aa3cf793d0eb"
 dependencies = [
- "libc",
+ "libc 0.2.158",
 ]
 
 [[package]]
@@ -390,7 +431,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7447f1ca1b7b563588a205fe93dea8df60fd981423a768bc1c0ded35ed147d0c"
 dependencies = [
  "kqueue-sys",
- "libc",
+ "libc 0.2.158",
 ]
 
 [[package]]
@@ -400,7 +441,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed9625ffda8729b85e45cf04090035ac368927b8cebc34898e7c120f52e4838b"
 dependencies = [
  "bitflags 1.3.2",
- "libc",
+ "libc 0.2.158",
 ]
 
 [[package]]
@@ -408,6 +449,11 @@ name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
+
+[[package]]
+name = "libc"
+version = "0.2.151"
+source = "git+https://github.com/rust-lang/libc#a6386afb10765f654a72a4c0b6fe89c1a75c3df7"
 
 [[package]]
 name = "libc"
@@ -422,7 +468,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c0ff37bd590ca25063e35af745c343cb7a0271906fb7b37e4813e8f79f00268d"
 dependencies = [
  "bitflags 2.6.0",
- "libc",
+ "libc 0.2.158",
  "redox_syscall",
 ]
 
@@ -469,10 +515,22 @@ version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4a650543ca06a924e8b371db273b2756685faae30f8487da1b56505a8f78b0c"
 dependencies = [
- "libc",
+ "libc 0.2.158",
  "log",
  "wasi",
  "windows-sys 0.48.0",
+]
+
+[[package]]
+name = "nix"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
+dependencies = [
+ "bitflags 2.6.0",
+ "cfg-if",
+ "cfg_aliases",
+ "libc 0.2.158",
 ]
 
 [[package]]
@@ -487,7 +545,7 @@ dependencies = [
  "fsevent-sys",
  "inotify",
  "kqueue",
- "libc",
+ "libc 0.2.158",
  "log",
  "mio",
  "walkdir",
@@ -556,7 +614,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e401f977ab385c9e4e3ab30627d6f26d00e2c73eef317493c4ec6d468726cf8"
 dependencies = [
  "cfg-if",
- "libc",
+ "libc 0.2.158",
  "redox_syscall",
  "smallvec",
  "windows-targets 0.52.6",
@@ -626,7 +684,7 @@ checksum = "8acb788b847c24f28525660c4d7758620a7210875711f79e7f663cc152726811"
 dependencies = [
  "bitflags 2.6.0",
  "errno",
- "libc",
+ "libc 0.2.158",
  "linux-raw-sys",
  "windows-sys 0.52.0",
 ]
