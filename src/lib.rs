@@ -2,11 +2,15 @@
 // TODO: landlock support
 // TODO: think about atomically writting files
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use iroh_blake3::Hash as ContentHash;
-use notify_debouncer_full::notify::{self, RecommendedWatcher, RecursiveMode, Watcher};
+use notify_debouncer_full::notify::{
+    self,
+    event::{CreateKind, RemoveKind},
+    RecommendedWatcher, RecursiveMode, Watcher,
+};
 use std::{
-    collections::{btree_map, BTreeMap, HashMap},
+    collections::{btree_map, BTreeMap, HashMap, HashSet},
     io::ErrorKind,
     os::fd::BorrowedFd,
     path::{Path, PathBuf},
@@ -117,19 +121,45 @@ impl FsState {
             Ok(None)
         }
     }
-
-    pub fn refresh_paths(
+    pub fn refresh_full_rescan(
         &mut self,
         root: &Path,
-        paths: &[PathBuf],
+        directory: &Path,
         content_store: &mut ContentStore,
     ) -> Result<FsStateDiff> {
         let mut diff = FsStateDiff {
             files: BTreeMap::new(),
         };
-        for path in paths {
-            if let Some((file_path, change)) = self.refresh_path(root, path, content_store)? {
-                diff.files.insert(file_path, change);
+        let full_dir_path = root.join(directory);
+        let dir_prefix = FilePath::from_root_and_path(&full_dir_path, root)?;
+
+        // Remove entries that no longer exist
+        let removed: Vec<_> = self
+            .files
+            .range(dir_prefix.clone()..)
+            .take_while(|(k, _)| k.0.starts_with(&*dir_prefix.0))
+            .filter(|(k, _)| !k.to_absolute(root).exists())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        for (file_path, metadata) in removed {
+            self.files.remove(&file_path);
+            diff.files
+                .insert(file_path, FileChange::Removed { old_meta: metadata });
+        }
+
+        // Walk the directory and update/add entries
+        for entry in ignore::Walk::new(&full_dir_path) {
+            let Ok(entry) = entry else {
+                continue;
+            };
+            if entry.file_type().map_or(false, |d| d.is_file()) {
+                let file_path = FilePath::from_root_and_path(entry.path(), root)?;
+                if let Some((file_path, change)) =
+                    self.refresh_path(root, entry.path(), content_store)?
+                {
+                    diff.files.insert(file_path, change);
+                }
             }
         }
         Ok(diff)
@@ -341,6 +371,12 @@ pub enum NodeMessage {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RefreshRequest {
+    FullRescan(PathBuf),
+    Path(PathBuf),
+}
+
 impl std::fmt::Debug for NodeMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -353,6 +389,100 @@ impl std::fmt::Debug for NodeMessage {
                 .debug_struct("ChangesResponse")
                 .field("accepted_diff", accepted_diff)
                 .finish(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NodeInit {
+    this_state: FsState,
+    other_state: Option<FsState>,
+    should_override: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum NodeInitMessage {
+    NodeAnnouncement { state: FsState },
+    Override { new_content: Vec<Vec<u8>> },
+    OverrideAck,
+}
+
+impl NodeInit {
+    pub fn from_disk(
+        root: &Path,
+        content_store: &mut ContentStore,
+        should_override: bool,
+    ) -> Result<Self> {
+        let this_state = FsState::from_disk(root, content_store)?;
+        Ok(Self {
+            this_state,
+            other_state: None,
+            should_override,
+        })
+    }
+    pub fn announce(&self) -> NodeInitMessage {
+        NodeInitMessage::NodeAnnouncement {
+            state: self.this_state.clone(),
+        }
+    }
+
+    fn override_other(&mut self, content_store: &mut ContentStore) -> NodeInitMessage {
+        let diff = self.this_state.diff(&self.other_state.as_ref().unwrap());
+        let new_content_hashes = content_store.drain_new_contents();
+        let other_hashes: HashSet<_> = self
+            .other_state
+            .as_ref()
+            .unwrap()
+            .files
+            .values()
+            .map(|meta| meta.content_hash)
+            .collect();
+        let new_content: Vec<Vec<u8>> = new_content_hashes
+            .into_iter()
+            .filter(|hash| !other_hashes.contains(hash))
+            .map(|hash| content_store.get(&hash).unwrap().to_vec())
+            .collect();
+        NodeInitMessage::Override { new_content }
+    }
+
+    pub fn handle_init_message(
+        &mut self,
+        root: &Path,
+        message: NodeInitMessage,
+        content_store: &mut ContentStore,
+    ) -> Result<(Option<Node>, Option<NodeInitMessage>)> {
+        match message {
+            NodeInitMessage::NodeAnnouncement { state: other_state } => {
+                self.other_state = Some(other_state);
+                if self.should_override {
+                    Ok((None, Some(self.override_other(content_store))))
+                } else {
+                    Ok((None, None))
+                }
+            }
+            NodeInitMessage::Override { new_content } => {
+                if self.other_state.is_none() {
+                    bail!("Cannot apply override without other state");
+                }
+                for content in new_content {
+                    content_store.add(content);
+                }
+                let diff = self.this_state.diff(self.other_state.as_ref().unwrap());
+                self.other_state.as_mut().unwrap().apply_diff_to_disk(
+                    &diff,
+                    root,
+                    content_store,
+                )?;
+                let node = Node::new(self.this_state.clone(), self.other_state.take().unwrap());
+                Ok((Some(node), Some(NodeInitMessage::OverrideAck)))
+            }
+            NodeInitMessage::OverrideAck => {
+                if self.other_state.is_none() {
+                    bail!("Cannot accept override ask without other state");
+                }
+                let node = Node::new(self.this_state.clone(), self.other_state.take().unwrap());
+                Ok((Some(node), None))
+            }
         }
     }
 }
@@ -469,13 +599,32 @@ impl Node {
         Ok(accepted_diff)
     }
 
-    pub fn refresh_paths(
+    pub fn refresh_requests(
         &mut self,
         root: &Path,
-        paths: &[PathBuf],
+        requests: &[RefreshRequest],
         content_store: &mut ContentStore,
     ) -> Result<Option<NodeMessage>> {
-        let diff = self.this_state.refresh_paths(root, paths, content_store)?;
+        let mut diff = FsStateDiff {
+            files: BTreeMap::new(),
+        };
+        for request in requests {
+            match request {
+                RefreshRequest::FullRescan(path) => {
+                    let dir_diff =
+                        self.this_state
+                            .refresh_full_rescan(root, path, content_store)?;
+                    diff.files.extend(dir_diff.files);
+                }
+                RefreshRequest::Path(path) => {
+                    if let Some((file_path, change)) =
+                        self.this_state.refresh_path(root, path, content_store)?
+                    {
+                        diff.files.insert(file_path, change);
+                    }
+                }
+            }
+        }
         if diff.is_empty() {
             return Ok(None);
         }
@@ -501,7 +650,7 @@ impl Node {
 // so we get git ignored files in diffs :/
 pub fn watch_root(
     root: &Path,
-    handler: impl Fn(Vec<PathBuf>) + Send + 'static,
+    handler: impl Fn(Vec<RefreshRequest>) + Send + 'static,
 ) -> Result<RecommendedWatcher> {
     let mut watcher = notify::RecommendedWatcher::new(
         move |result: Result<notify::Event, _>| {
@@ -509,7 +658,24 @@ pub fn watch_root(
                 error!("Error in file watcher");
                 return;
             };
-            handler(event.paths);
+            let is_dir = match event.kind {
+                notify::EventKind::Any => false,
+                notify::EventKind::Access(_) => return,
+                notify::EventKind::Create(x) => x == CreateKind::Folder,
+                notify::EventKind::Modify(_) => false,
+                notify::EventKind::Remove(x) => x == RemoveKind::Folder,
+                notify::EventKind::Other => false,
+            };
+            let requests: Vec<RefreshRequest> = event
+                .paths
+                .into_iter()
+                .map(if is_dir {
+                    RefreshRequest::FullRescan
+                } else {
+                    RefreshRequest::Path
+                })
+                .collect();
+            handler(requests);
         },
         Default::default(),
     )?;
@@ -519,164 +685,7 @@ pub fn watch_root(
     watcher.watch(root, RecursiveMode::Recursive)?;
     Ok(watcher)
 }
-#[cfg(target_os = "linux")]
-pub fn watch_root_fanotify(
-    root: &Path,
-    handler: impl Fn(Vec<PathBuf>) + Send + 'static,
-) -> Result<()> {
-    use bstr::BStr;
-    use libc::__u32;
-    use nix::errno::Errno;
-    use nix::sys::fanotify::{
-        EventFFlags, Fanotify, FanotifyEvent, FanotifyResponse, InitFlags, MarkFlags, MaskFlags,
-        Response,
-    };
-    use nix::unistd::read;
-    use std::ffi::{c_int, CStr, CString, OsStr};
-    use std::mem::MaybeUninit;
-    use std::os::fd::AsFd;
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::{fd::FromRawFd, unix::io::AsRawFd};
-    use std::ptr;
-    use tracing::info;
 
-    let flags = InitFlags::FAN_CLASS_NOTIF;
-    let event_f_flags = EventFFlags::O_RDONLY | EventFFlags::O_CLOEXEC;
-    let res = Errno::result(unsafe {
-        libc::fanotify_init(
-            flags.bits() | libc::FAN_REPORT_FID | libc::FAN_REPORT_DFID_NAME,
-            event_f_flags.bits(),
-        )
-    });
-    let fanotify: Fanotify = res.map(|fd| unsafe { Fanotify::from_raw_fd(fd) })?;
-
-    fanotify.mark(
-        MarkFlags::FAN_MARK_ADD,
-        MaskFlags::FAN_ACCESS
-            | MaskFlags::FAN_MODIFY
-            | MaskFlags::FAN_CLOSE_WRITE
-            | MaskFlags::FAN_MOVED_FROM
-            | MaskFlags::FAN_MOVED_TO
-            | MaskFlags::FAN_CREATE
-            | MaskFlags::FAN_DELETE
-            | MaskFlags::FAN_DELETE_SELF
-            | MaskFlags::FAN_MOVE_SELF
-            | MaskFlags::FAN_EVENT_ON_CHILD,
-        None,
-        Some(root),
-    )?;
-
-    pub fn read_events(fd: BorrowedFd<'_>) -> Result<()> {
-        let metadata_size = size_of::<libc::fanotify_event_metadata>();
-        const BUFSIZ: usize = 4096;
-        let mut buffer = [0u8; BUFSIZ];
-        let mut offset = 0;
-
-        let nread = read(fd.as_raw_fd(), &mut buffer)?;
-
-        dbg!(nread);
-        while (nread - offset) >= metadata_size {
-            let metadata = unsafe {
-                let mut metadata = MaybeUninit::<libc::fanotify_event_metadata>::uninit();
-                ptr::copy_nonoverlapping(
-                    buffer.as_ptr().add(offset),
-                    metadata.as_mut_ptr().cast(),
-                    (BUFSIZ - offset).min(metadata_size),
-                );
-                metadata.assume_init()
-            };
-            let event_end = offset + metadata.event_len as usize;
-            offset += metadata.metadata_len as usize;
-            // TODO: handle multiple events
-            if event_end != offset {
-                let info_header = unsafe {
-                    let mut header = MaybeUninit::<libc::fanotify_event_info_header>::uninit();
-                    ptr::copy_nonoverlapping(
-                        buffer.as_ptr().add(offset),
-                        header.as_mut_ptr().cast(),
-                        std::mem::size_of::<libc::fanotify_event_info_header>(),
-                    );
-                    header.assume_init()
-                };
-
-                dbg!(info_header.info_type, info_header.len);
-                match info_header.info_type {
-                    libc::FAN_EVENT_INFO_TYPE_FID => {
-                        let fid = unsafe {
-                            let mut fid = MaybeUninit::<libc::fanotify_event_info_fid>::uninit();
-                            ptr::copy_nonoverlapping(
-                                buffer.as_ptr().add(offset),
-                                fid.as_mut_ptr().cast(),
-                                info_header.len as usize,
-                            );
-                            fid.assume_init()
-                        };
-
-                        // Process the fid information here
-                        let file_handle = unsafe {
-                            std::slice::from_raw_parts(
-                                fid.handle.as_ptr(),
-                                fid.hdr.len as usize
-                                    - std::mem::size_of::<libc::fanotify_event_info_fid>(),
-                            )
-                        };
-                        // Handle FID event
-                    }
-                    libc::FAN_EVENT_INFO_TYPE_DFID => {
-                        let dfid = unsafe {
-                            let mut dfid = MaybeUninit::<libc::fanotify_event_info_fid>::uninit();
-                            ptr::copy_nonoverlapping(
-                                buffer.as_ptr().add(offset),
-                                dfid.as_mut_ptr().cast(),
-                                std::mem::size_of::<libc::fanotify_event_info_fid>(),
-                            );
-                            dfid.assume_init()
-                        };
-                        // Handle DFID event
-                    }
-                    libc::FAN_EVENT_INFO_TYPE_DFID_NAME => {
-                        let dfid_name = unsafe {
-                            let mut dfid_name =
-                                MaybeUninit::<libc::fanotify_event_info_fid>::uninit();
-                            ptr::copy_nonoverlapping(
-                                buffer.as_ptr().add(offset),
-                                dfid_name.as_mut_ptr().cast(),
-                                std::mem::size_of::<libc::fanotify_event_info_fid>(),
-                            );
-                            dfid_name.assume_init()
-                        };
-                        let handle = unsafe {
-                            std::slice::from_raw_parts(
-                                buffer.as_ptr().add(
-                                    offset + std::mem::size_of::<libc::fanotify_event_info_fid>(),
-                                ),
-                                info_header.len as usize
-                                    - std::mem::size_of::<libc::fanotify_event_info_fid>(),
-                            )
-                        };
-                        let handle_size = __u32::from_le_bytes(
-                            <_>::try_from(&handle[0..std::mem::size_of::<__u32>()]).unwrap(),
-                        );
-                        let name = &handle[handle_size as usize
-                            + std::mem::size_of::<c_int>()
-                            + std::mem::size_of::<__u32>()..];
-                        let name = unsafe { CStr::from_ptr(name.as_ptr()).to_owned() };
-                        dbg!(name);
-                    }
-                    _ => {}
-                }
-            }
-            offset = event_end;
-        }
-        Ok(())
-    }
-    std::thread::spawn(move || loop {
-        read_events(fanotify.as_fd()).unwrap();
-        let _ = &handler;
-    });
-
-    Ok(())
-}
 #[cfg(test)]
 mod tests {
     use super::*;

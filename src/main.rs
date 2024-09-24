@@ -1,7 +1,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use crossbeam_channel::{Receiver, RecvError, RecvTimeoutError, Sender};
-use fync::{watch_root, watch_root_fanotify, ContentStore, FsState, Node, NodeMessage};
+use fync::{
+    watch_root, ContentStore, FsState, Node, NodeInit, NodeInitMessage, NodeMessage, RefreshRequest,
+};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -42,10 +44,9 @@ fn main() -> Result<()> {
 
 fn watch_command(directory: PathBuf) -> Result<()> {
     let (watch_tx, watch_rx) = crossbeam_channel::bounded(32);
-    let _watcher = watch_root_fanotify(&directory, move |paths| {
+    let _watcher = watch_root(&directory, move |paths| {
         let _ = watch_tx.send(paths);
     });
-    dbg!(_watcher);
 
     loop {
         match debounce_watcher(watch_rx.recv()?, &watch_rx) {
@@ -67,25 +68,35 @@ fn sync_command(source: PathBuf, destination: PathBuf) -> Result<()> {
     let destination = destination.canonicalize()?;
 
     let mut content_store = ContentStore::default();
-    let source_state = FsState::from_disk(&source, &mut content_store)?;
-    let dest_state = FsState::from_disk(&destination, &mut content_store)?;
-
     let content_store = Arc::new(Mutex::new(content_store));
 
-    let mut source_node = Node::new(source_state.clone(), dest_state.clone());
-    let mut dest_node = Node::new(dest_state, source_state);
+    let (source_init_out, dest_init_in) = crossbeam_channel::bounded::<NodeInitMessage>(32);
+    let (dest_init_out, source_init_in) = crossbeam_channel::bounded::<NodeInitMessage>(32);
 
-    // Initial sync
-    let initial_source_diff = source_node.changes_for_other();
-    info!("Initial sync started");
-    debug!(?initial_source_diff);
+    let source_init = NodeInit::from_disk(&source, &mut content_store.lock().unwrap(), true)?;
+    let dest_init = NodeInit::from_disk(&destination, &mut content_store.lock().unwrap(), false)?;
 
-    dest_node.apply_changes_from_other_to_disk(
-        &initial_source_diff,
-        &destination,
-        &mut content_store.lock().unwrap(),
-    )?;
-    source_node.changes_acked_by_other(&initial_source_diff);
+    let (source_node, dest_node) = scope(|s| {
+        let source_handle = s.spawn(|| {
+            run_node_init(
+                source_init,
+                source.clone(),
+                source_init_in,
+                source_init_out,
+                content_store.clone(),
+            )
+        });
+        let dest_handle = s.spawn(|| {
+            run_node_init(
+                dest_init,
+                destination.clone(),
+                dest_init_in,
+                dest_init_out,
+                content_store.clone(),
+            )
+        });
+        anyhow::Ok((source_handle.join().unwrap()?, dest_handle.join().unwrap()?))
+    })?;
 
     info!("Initial sync completed successfully");
 
@@ -118,6 +129,30 @@ fn sync_command(source: PathBuf, destination: PathBuf) -> Result<()> {
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
 }
+#[instrument(skip_all, fields(?root), err, ret)]
+fn run_node_init(
+    mut node_init: NodeInit,
+    root: PathBuf,
+    input: Receiver<NodeInitMessage>,
+    output: Sender<NodeInitMessage>,
+    content_store: Arc<Mutex<ContentStore>>,
+) -> Result<Node> {
+    output.send(node_init.announce());
+    loop {
+        let init_message = input.recv()?;
+        let (node, response) = node_init.handle_init_message(
+            &root,
+            init_message,
+            &mut content_store.lock().unwrap(),
+        )?;
+        if let Some(response) = response {
+            output.send(response)?;
+        }
+        if let Some(node) = node {
+            return Ok(node);
+        }
+    }
+}
 
 #[instrument(skip_all, fields(?root), err, ret)]
 fn run_node(
@@ -136,7 +171,7 @@ fn run_node(
         #[derive(Debug)]
         enum Event {
             Message(NodeMessage),
-            Refresh(Vec<PathBuf>),
+            Refresh(Vec<RefreshRequest>),
         }
         let event = crossbeam_channel::select! {
             recv(input) -> msg => {
@@ -159,7 +194,7 @@ fn run_node(
                 node.handle_message_disk(msg, &root, &mut content_store.lock().unwrap())?
             }
             Event::Refresh(path_list) => {
-                node.refresh_paths(&root, &path_list, &mut content_store.lock().unwrap())?
+                node.refresh_requests(&root, &path_list, &mut content_store.lock().unwrap())?
             }
         };
         if let Some(response) = response {
@@ -170,9 +205,9 @@ fn run_node(
 }
 
 fn debounce_watcher(
-    path_list: Vec<PathBuf>,
-    rx: &Receiver<Vec<PathBuf>>,
-) -> Result<Vec<PathBuf>, RecvError> {
+    path_list: Vec<RefreshRequest>,
+    rx: &Receiver<Vec<RefreshRequest>>,
+) -> Result<Vec<RefreshRequest>, RecvError> {
     let mut paths = BTreeSet::new();
     paths.extend(path_list);
     let debounce_deadline = Instant::now() + Duration::from_millis(20);
