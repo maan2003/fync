@@ -36,7 +36,6 @@
             src = ./.;
             cargoLock = {
                 lockFile = ./Cargo.lock;
-                outputHashes."libc-0.2.151" = "sha256-lmmQrQGdwPeUgWwywKVbhjQwzRJvlRQc8Ird1MvXiTc=";
             };
         };
       });

@@ -205,7 +205,6 @@ fn debounce_watcher(
     loop {
         match rx.recv_deadline(debounce_deadline) {
             Ok(path_list) => {
-                info!(?path_list, "more events");
                 paths.extend(path_list)
             }
             Err(RecvTimeoutError::Timeout) => break,
@@ -217,6 +216,5 @@ fn debounce_watcher(
             }
         }
     }
-    info!(?paths, "refreshing");
     Ok(paths.into_iter().collect())
 }
