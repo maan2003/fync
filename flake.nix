@@ -29,7 +29,17 @@
 
           };
       });
-
+      packages = forAllSystems ({ system, pkgs, ... }: {
+        default = pkgs.rustPlatform.buildRustPackage {
+            pname = "fync";
+            version = "0.1.0";
+            src = ./.;
+            cargoLock = {
+                lockFile = ./Cargo.lock;
+                outputHashes."libc-0.2.151" = "sha256-lmmQrQGdwPeUgWwywKVbhjQwzRJvlRQc8Ird1MvXiTc=";
+            };
+        };
+      });
       # Compatibility with older Nix installations that don't check for `devShells.<arch>.default` first.
       devShell = forAllSystems ({ system, ... }: self.devShells.${system}.default);
   };

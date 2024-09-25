@@ -1,8 +1,10 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
+use bincode::config::standard;
 use clap::{Parser, Subcommand};
 use crossbeam_channel::{Receiver, RecvError, RecvTimeoutError, Sender};
 use fync::{watch_root, AnyNodeMessage, ContentStore, NodeInit, NodeMessage, RefreshRequest};
 use std::collections::BTreeSet;
+use std::io::{stderr, Write};
 use std::path::{Path, PathBuf};
 use std::thread::scope;
 use std::time::{Duration, Instant};
@@ -23,11 +25,16 @@ enum Commands {
     Watch {
         directory: PathBuf,
     },
+    RunStdio {
+        root: PathBuf,
+        #[arg(short)]
+        override_other: bool,
+    },
 }
 
 #[instrument]
 fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt::fmt().with_writer(stderr).init();
     let args = Args::parse();
 
     match args.command {
@@ -36,6 +43,10 @@ fn main() -> Result<()> {
             destination,
         } => sync_command(source, destination),
         Commands::Watch { directory } => watch_command(directory),
+        Commands::RunStdio {
+            root,
+            override_other,
+        } => run_node_stdio(&root, override_other),
     }
 }
 
@@ -72,6 +83,47 @@ fn sync_command(src: PathBuf, dst: PathBuf) -> Result<()> {
         info!("Watching for changes. Press Ctrl+C to exit.");
     });
     Ok(())
+}
+
+#[instrument(skip_all, fields(?root), err, ret)]
+fn run_node_stdio(root: &Path, override_other: bool) -> Result<()> {
+    let (input_tx, input_rx) = crossbeam_channel::unbounded();
+    let (output_tx, output_rx) = crossbeam_channel::unbounded();
+
+    // TODO: figure out how to indicate end.
+    let stdin_thread = std::thread::spawn(move || -> Result<()> {
+        let stdin = std::io::stdin();
+        let stdin = stdin.lock();
+        let mut reader = std::io::BufReader::new(stdin);
+        loop {
+            let msg = bincode::decode_from_reader(&mut reader, standard())?;
+            input_tx.send(msg)?;
+        }
+    });
+
+    let stdout_thread = std::thread::spawn(move || {
+        let stdout = std::io::stdout();
+        let stdout = stdout.lock();
+        let mut writer = std::io::BufWriter::new(stdout);
+        while let Ok(msg) = output_rx.recv() {
+            bincode::encode_into_std_write(&msg, &mut writer, standard())?;
+            writer.flush()?;
+        }
+        anyhow::Ok(())
+    });
+
+    let result = run_node(root, input_rx, output_tx, override_other);
+
+    stdin_thread
+        .join()
+        .expect("stdin thread panicked")
+        .context("stdin thread")?;
+    stdout_thread
+        .join()
+        .expect("stdout thread panicked")
+        .context("stdout thread")?;
+
+    result
 }
 
 #[instrument(skip_all, fields(?root), err, ret)]

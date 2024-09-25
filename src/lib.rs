@@ -3,7 +3,8 @@
 // TODO: think about atomically writting files
 
 use anyhow::{bail, Context, Result};
-use iroh_blake3::Hash as ContentHash;
+use bincode::{Decode, Encode};
+use blake3::Hash as ContentHash;
 use notify_debouncer_full::notify::{
     self,
     event::{CreateKind, RemoveKind},
@@ -18,15 +19,16 @@ use std::{
 use tracing::error;
 
 /// A relative path to some root.
-#[derive(Debug, Eq, PartialOrd, Ord, PartialEq, Clone)]
+#[derive(Debug, Eq, PartialOrd, Ord, PartialEq, Clone, Encode, Decode)]
 pub struct FilePath(Arc<str>);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct FileMetadata {
+    #[bincode(with_serde)]
     content_hash: ContentHash,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct FsState {
     files: BTreeMap<FilePath, FileMetadata>,
 }
@@ -263,13 +265,13 @@ impl FsState {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub struct FsStateDiff {
     // TODO: avoid sending same file path again and again
     files: BTreeMap<FilePath, FileChange>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub enum FileChange {
     Removed {
         old_meta: FileMetadata,
@@ -321,7 +323,7 @@ pub struct ContentStore {
 
 impl ContentStore {
     pub fn add(&mut self, content: Vec<u8>) -> ContentHash {
-        let hash = iroh_blake3::hash(&content);
+        let hash = blake3::hash(&content);
         self.insert(hash, content);
         hash
     }
@@ -352,13 +354,14 @@ impl ContentStore {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub struct Node {
     this_state: FsState,
     other_state: FsState,
     conflicts: Vec<FilePath>,
 }
 
+#[derive(Clone, Encode, Decode)]
 pub enum NodeMessage {
     Changes {
         new_content: Vec<Vec<u8>>,
@@ -398,13 +401,14 @@ pub struct NodeInit {
     should_override: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub enum NodeInitMessage {
     NodeAnnouncement { state: FsState },
     Override { new_content: Vec<Vec<u8>> },
     OverrideAck,
 }
 
+#[derive(Debug, Clone, Encode, Decode)]
 pub enum AnyNodeMessage {
     Init(NodeInitMessage),
     Regular(NodeMessage),
