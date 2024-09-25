@@ -112,7 +112,7 @@ fn run_node_stdio(root: &Path, override_other: bool) -> Result<()> {
         anyhow::Ok(())
     });
 
-    let result = run_node(root, input_rx, output_tx, override_other);
+    let result = run_node(&root, input_rx, output_tx, override_other);
 
     stdin_thread
         .join()
