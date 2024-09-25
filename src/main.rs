@@ -2,14 +2,13 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use crossbeam_channel::{Receiver, RecvError, RecvTimeoutError, Sender};
 use fync::{
-    watch_root, ContentStore, FsState, Node, NodeInit, NodeInitMessage, NodeMessage, RefreshRequest,
+    watch_root, ContentStore, Node, NodeInit, NodeInitMessage, NodeMessage, RefreshRequest,
 };
 use std::collections::BTreeSet;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
 use std::thread::scope;
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{info, instrument};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -63,64 +62,34 @@ fn watch_command(directory: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn sync_command(source: PathBuf, destination: PathBuf) -> Result<()> {
-    let source = source.canonicalize()?;
-    let destination = destination.canonicalize()?;
+fn sync_command(src: PathBuf, dst: PathBuf) -> Result<()> {
+    let src_root = src.canonicalize()?;
+    let dst_root = dst.canonicalize()?;
 
-    let mut content_store = ContentStore::default();
-    let content_store = Arc::new(Mutex::new(content_store));
+    let mut content_store_src = ContentStore::default();
+    let mut content_store_dst = ContentStore::default();
 
-    let (source_init_out, dest_init_in) = crossbeam_channel::bounded::<NodeInitMessage>(32);
-    let (dest_init_out, source_init_in) = crossbeam_channel::bounded::<NodeInitMessage>(32);
+    let (src_out, dst_in) = crossbeam_channel::bounded::<NodeInitMessage>(32);
+    let (dst_out, src_in) = crossbeam_channel::bounded::<NodeInitMessage>(32);
 
-    let source_init = NodeInit::from_disk(&source, &mut content_store.lock().unwrap(), true)?;
-    let dest_init = NodeInit::from_disk(&destination, &mut content_store.lock().unwrap(), false)?;
+    let src_init = NodeInit::from_disk(&src_root, &mut content_store_src, true)?;
+    let dst_init = NodeInit::from_disk(&dst_root, &mut content_store_dst, false)?;
 
-    let (source_node, dest_node) = scope(|s| {
-        let source_handle = s.spawn(|| {
-            run_node_init(
-                source_init,
-                source.clone(),
-                source_init_in,
-                source_init_out,
-                content_store.clone(),
-            )
-        });
-        let dest_handle = s.spawn(|| {
-            run_node_init(
-                dest_init,
-                destination.clone(),
-                dest_init_in,
-                dest_init_out,
-                content_store.clone(),
-            )
-        });
+    let (src_node, dst_node) = scope(|s| {
+        let source_handle =
+            s.spawn(|| run_node_init(src_init, &src_root, src_in, src_out, &mut content_store_src));
+        let dest_handle =
+            s.spawn(|| run_node_init(dst_init, &dst_root, dst_in, dst_out, &mut content_store_dst));
         anyhow::Ok((source_handle.join().unwrap()?, dest_handle.join().unwrap()?))
     })?;
 
     info!("Initial sync completed successfully");
 
-    let (dest_out, source_in) = crossbeam_channel::bounded::<NodeMessage>(32);
-    let (source_out, dest_in) = crossbeam_channel::bounded::<NodeMessage>(32);
+    let (dst_out, src_in) = crossbeam_channel::bounded::<NodeMessage>(32);
+    let (src_out, dst_in) = crossbeam_channel::bounded::<NodeMessage>(32);
     scope(|s| {
-        s.spawn(|| {
-            run_node(
-                source_node,
-                source,
-                source_in,
-                source_out,
-                content_store.clone(),
-            )
-        });
-        s.spawn(|| {
-            run_node(
-                dest_node,
-                destination,
-                dest_in,
-                dest_out,
-                content_store.clone(),
-            )
-        });
+        s.spawn(|| run_node(src_node, &src_root, src_in, src_out, &mut content_store_src));
+        s.spawn(|| run_node(dst_node, &dst_root, dst_in, dst_out, &mut content_store_dst));
         info!("Watching for changes. Press Ctrl+C to exit.");
     });
 
@@ -132,19 +101,15 @@ fn sync_command(source: PathBuf, destination: PathBuf) -> Result<()> {
 #[instrument(skip_all, fields(?root), err, ret)]
 fn run_node_init(
     mut node_init: NodeInit,
-    root: PathBuf,
+    root: &Path,
     input: Receiver<NodeInitMessage>,
     output: Sender<NodeInitMessage>,
-    content_store: Arc<Mutex<ContentStore>>,
+    content_store: &mut ContentStore,
 ) -> Result<Node> {
-    output.send(node_init.announce());
+    output.send(node_init.announce())?;
     loop {
         let init_message = input.recv()?;
-        let (node, response) = node_init.handle_init_message(
-            &root,
-            init_message,
-            &mut content_store.lock().unwrap(),
-        )?;
+        let (node, response) = node_init.handle_init_message(root, init_message, content_store)?;
         if let Some(response) = response {
             output.send(response)?;
         }
@@ -157,13 +122,13 @@ fn run_node_init(
 #[instrument(skip_all, fields(?root), err, ret)]
 fn run_node(
     mut node: Node,
-    root: PathBuf,
+    root: &Path,
     input: Receiver<NodeMessage>,
     output: Sender<NodeMessage>,
-    content_store: Arc<Mutex<ContentStore>>,
+    content_store: &mut ContentStore,
 ) -> std::result::Result<(), anyhow::Error> {
     let (watch_tx, watch_rx) = crossbeam_channel::bounded(32);
-    let _watcher = watch_root(&root, move |paths| {
+    let _watcher = watch_root(root, move |paths| {
         // FIXME: stop watching if other side dies.
         let _ = watch_tx.send(paths);
     });
@@ -190,12 +155,8 @@ fn run_node(
         };
         info!(?event, "processing event");
         let response = match event {
-            Event::Message(msg) => {
-                node.handle_message_disk(msg, &root, &mut content_store.lock().unwrap())?
-            }
-            Event::Refresh(path_list) => {
-                node.refresh_requests(&root, &path_list, &mut content_store.lock().unwrap())?
-            }
+            Event::Message(msg) => node.handle_message_disk(msg, root, content_store)?,
+            Event::Refresh(path_list) => node.refresh_requests(root, &path_list, content_store)?,
         };
         if let Some(response) = response {
             output.send(response)?;

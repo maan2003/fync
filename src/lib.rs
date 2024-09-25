@@ -12,7 +12,6 @@ use notify_debouncer_full::notify::{
 use std::{
     collections::{btree_map, BTreeMap, HashMap, HashSet},
     io::ErrorKind,
-    os::fd::BorrowedFd,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -154,7 +153,6 @@ impl FsState {
                 continue;
             };
             if entry.file_type().map_or(false, |d| d.is_file()) {
-                let file_path = FilePath::from_root_and_path(entry.path(), root)?;
                 if let Some((file_path, change)) =
                     self.refresh_path(root, entry.path(), content_store)?
                 {
@@ -427,7 +425,6 @@ impl NodeInit {
     }
 
     fn override_other(&mut self, content_store: &mut ContentStore) -> NodeInitMessage {
-        let diff = self.this_state.diff(&self.other_state.as_ref().unwrap());
         let new_content_hashes = content_store.drain_new_contents();
         let other_hashes: HashSet<_> = self
             .other_state
