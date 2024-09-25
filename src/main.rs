@@ -85,8 +85,8 @@ fn sync_command(src: PathBuf, dst: PathBuf) -> Result<()> {
     Ok(())
 }
 
-#[instrument(skip_all, fields(?root), err, ret)]
 fn run_node_stdio(root: &Path, override_other: bool) -> Result<()> {
+    let root = root.canonicalize()?;
     let (input_tx, input_rx) = crossbeam_channel::unbounded();
     let (output_tx, output_rx) = crossbeam_channel::unbounded();
 
