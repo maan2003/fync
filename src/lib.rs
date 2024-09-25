@@ -405,6 +405,11 @@ pub enum NodeInitMessage {
     OverrideAck,
 }
 
+pub enum AnyNodeMessage {
+    Init(NodeInitMessage),
+    Regular(NodeMessage),
+}
+
 impl NodeInit {
     pub fn from_disk(
         root: &Path,
