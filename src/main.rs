@@ -5,8 +5,9 @@ use crossbeam_channel::{Receiver, RecvError, RecvTimeoutError, Sender};
 use fync::{watch_root, AnyNodeMessage, ContentStore, NodeInit, NodeMessage, RefreshRequest};
 use regex::Regex;
 use std::collections::BTreeSet;
-use std::io::{stderr, Write};
+use std::io::{stderr, Write, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::thread::scope;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, instrument};
@@ -33,6 +34,13 @@ enum Commands {
         #[arg(short)]
         override_other: bool,
     },
+    SshSync {
+        local_root: PathBuf,
+        remote_host: String,
+        remote_root: PathBuf,
+        #[arg(short)]
+        override_remote: bool,
+    },
 }
 
 #[instrument]
@@ -51,6 +59,12 @@ fn main() -> Result<()> {
             root,
             override_other,
         } => run_node_stdio(&root, override_other, &regex),
+        Commands::SshSync {
+            local_root,
+            remote_host,
+            remote_root,
+            override_remote,
+        } => ssh_sync_command(local_root, remote_host, remote_root, override_remote, &regex),
     }
 }
 
@@ -254,4 +268,69 @@ fn debounce_watcher(
             RefreshRequest::Path(path) => path.to_str().map_or(false, |x| !ignore.is_match(x)),
         })
         .collect())
+}
+fn ssh_sync_command(local_root: PathBuf, remote_host: String, remote_root: PathBuf, override_remote: bool, ignore: &Regex) -> Result<()> {
+    let local_root = local_root.canonicalize()?;
+    
+    // Construct the remote command
+    let remote_command = format!("fync run-stdio {} {}", 
+        if override_remote { "-o" } else { "" },
+        remote_root.display()
+    );
+
+    // Spawn the SSH process
+    let mut child = Command::new("ssh")
+        .arg(&remote_host)
+        .arg(remote_command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+
+    let child_stdin = child.stdin.take().expect("Failed to open child stdin");
+    let child_stdout = child.stdout.take().expect("Failed to open child stdout");
+
+    let (remote_out, local_in) = crossbeam_channel::bounded::<AnyNodeMessage>(32);
+    let (local_out, remote_in) = crossbeam_channel::bounded::<AnyNodeMessage>(32);
+
+    scope(|s| {
+        s.spawn(|| run_node(&local_root, local_in, local_out, !override_remote, ignore));
+        
+        // Thread for reading from SSH child
+        s.spawn(move || {
+            let mut reader = BufReader::new(child_stdout);
+            loop {
+                match bincode::decode_from_reader(&mut reader, standard()) {
+                    Ok(msg) => {
+                        if remote_out.send(msg).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Thread for writing to SSH child
+        s.spawn(move || {
+            let mut writer = BufWriter::new(child_stdin);
+            while let Ok(msg) = remote_in.recv() {
+                if bincode::encode_into_std_write(&msg, &mut writer, standard()).is_err() {
+                    break;
+                }
+                if writer.flush().is_err() {
+                    break;
+                }
+            }
+        });
+
+        info!("SSH sync started. Press Ctrl+C to exit.");
+    });
+
+    // Wait for the child process to finish
+    let status = child.wait()?;
+    if !status.success() {
+        bail!("SSH process exited with non-zero status");
+    }
+
+    Ok(())
 }
