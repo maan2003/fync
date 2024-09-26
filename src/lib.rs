@@ -268,7 +268,7 @@ impl FsState {
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct FsStateDiff {
     // TODO: avoid sending same file path again and again
-    files: BTreeMap<FilePath, FileChange>,
+    pub files: BTreeMap<FilePath, FileChange>,
 }
 
 #[derive(Debug, Clone, Encode, Decode)]
@@ -590,6 +590,10 @@ impl Node {
         root: &Path,
         content_store: &mut ContentStore,
     ) -> anyhow::Result<FsStateDiff> {
+        let conflicts = self.other_state.apply_diff(diff);
+        if !conflicts.is_empty() {
+            error!("Unexpected conflicts in other state");
+        }
         let conflicts = self
             .this_state
             .apply_diff_to_disk(diff, root, content_store)?;

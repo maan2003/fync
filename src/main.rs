@@ -9,7 +9,7 @@ use std::io::{stderr, Write};
 use std::path::{Path, PathBuf};
 use std::thread::scope;
 use std::time::{Duration, Instant};
-use tracing::{info, instrument};
+use tracing::{debug, info, instrument};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -186,16 +186,41 @@ fn run_node(
                 }
             }
         };
-        info!(?event, "processing event");
-        let start_time = Instant::now();
+        debug!(?event, "Processing event");
         let response = match event {
-            Event::Message(msg) => node.handle_message_disk(msg, root, content_store)?,
+            Event::Message(msg) => {
+                match &msg {
+                    NodeMessage::Changes { diff, .. } => {
+                        info!("Received Changes: {} files", diff.files.len());
+                    }
+                    NodeMessage::ChangesResponse { accepted_diff } => {
+                        info!(
+                            "Received Response: {} files accepted",
+                            accepted_diff.files.len()
+                        );
+                    }
+                }
+                node.handle_message_disk(msg, root, content_store)?
+            }
             Event::Refresh(path_list) => node.refresh_requests(root, &path_list, content_store)?,
         };
         if let Some(response) = response {
+            match &response {
+                NodeMessage::Changes {
+                    new_content: _,
+                    diff,
+                } => {
+                    info!("Sending Changes: {} files", diff.files.len());
+                }
+                NodeMessage::ChangesResponse { accepted_diff } => {
+                    info!(
+                        "Sending Response: {} files accepted",
+                        accepted_diff.files.len()
+                    );
+                }
+            }
             output.send(AnyNodeMessage::Regular(response))?;
         }
-        info!("Event processing took {:?}", start_time.elapsed());
     }
     anyhow::Ok(())
 }
