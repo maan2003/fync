@@ -130,8 +130,7 @@ fn run_node_with_io<R: Read + Send + 'static, W: Write + Send + 'static>(
     let write_thread = std::thread::spawn(move || {
         let mut writer = BufWriter::new(writer);
         while let Ok(msg) = output_rx.recv() {
-            let size = bincode::encode_into_std_write(&msg, &mut writer, standard())?;
-            info!(?size, "sent message");
+            bincode::encode_into_std_write(&msg, &mut writer, standard())?;
             writer.flush()?;
         }
         anyhow::Ok(())
