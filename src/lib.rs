@@ -16,7 +16,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tracing::error;
+use tracing::{error, info};
 
 /// A relative path to some root.
 #[derive(Debug, Eq, PartialOrd, Ord, PartialEq, Clone, Encode, Decode)]
@@ -409,11 +409,13 @@ impl ContentStore {
         for compressed_diff in &content_diff.modified_content {
             let old_content = self.get(&compressed_diff.old_hash)?;
             // 100MB
-            const MAX_BYTES: usize = 1024 * 1024 * 1024 * 100;
+            const MAX_BYTES: usize = 1024 * 1024 * 100;
+            info!("decompressing");
             let decompressed = zstd::bulk::Decompressor::with_dictionary(old_content)
                 .unwrap()
                 .decompress(&compressed_diff.data, MAX_BYTES)
                 .unwrap();
+            info!("done");
             let new_hash = blake3::hash(&decompressed);
             self.contents.insert(new_hash, decompressed);
         }
