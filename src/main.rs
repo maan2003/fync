@@ -69,7 +69,7 @@ fn main() -> Result<()> {
             remote_host,
             remote_root,
             override_remote,
-            &regex,
+            &args.ignore_regex,
         ),
     }
 }
@@ -291,24 +291,23 @@ fn ssh_sync_command(
     remote_host: String,
     remote_root: PathBuf,
     override_remote: bool,
-    ignore: &Regex,
+    ignore: &str,
 ) -> Result<()> {
+    let regex = Regex::new(ignore).unwrap();
     let local_root = local_root.canonicalize()?;
 
-    // Construct the remote command
-    let remote_command = format!(
-        "fync run-stdio {} {}",
-        if override_remote { "-o" } else { "" },
-        remote_root.display()
-    );
-
+    let mut cmd = Command::new("ssh");
+    cmd.arg(&remote_host)
+        .arg("fync")
+        .arg("-i")
+        .arg(ignore)
+        .arg("run-stdio")
+        .arg(remote_root);
+    if override_remote {
+        cmd.arg("-o");
+    }
     // Spawn the SSH process
-    let mut child = Command::new("ssh")
-        .arg(&remote_host)
-        .arg(remote_command)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
+    let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
 
     let child_stdin = child.stdin.take().expect("Failed to open child stdin");
     let child_stdout = child.stdout.take().expect("Failed to open child stdout");
