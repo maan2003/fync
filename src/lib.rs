@@ -1050,6 +1050,4 @@ mod tests {
         assert_eq!(node1.this_state, state3);
         assert_eq!(node1.this_state, state2);
     }
-
-    // Message tests
 }
