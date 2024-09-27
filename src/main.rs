@@ -278,11 +278,17 @@ fn debounce_watcher(
     }
     Ok(paths
         .into_iter()
-        .filter(|x| match x {
-            RefreshRequest::FullRescan(path) => {
-                path.to_str().map_or(false, |x| !ignore.is_match(x))
+        .filter(|x| {
+            let found = match x {
+                RefreshRequest::FullRescan(path) => {
+                    path.to_str().map_or(false, |x| !ignore.is_match(x))
+                }
+                RefreshRequest::Path(path) => path.to_str().map_or(false, |x| !ignore.is_match(x)),
+            };
+            if found {
+                info!(?x, "discarding");
             }
-            RefreshRequest::Path(path) => path.to_str().map_or(false, |x| !ignore.is_match(x)),
+            found
         })
         .collect())
 }
