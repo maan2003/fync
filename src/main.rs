@@ -288,6 +288,8 @@ fn debounce_watcher(
             };
             if !found {
                 info!(?x, "discarding");
+            } else {
+                info!(?x, "not discarding");
             }
             found
         })
