@@ -585,7 +585,8 @@ impl NodeInit {
                 if self.other_state.is_none() {
                     bail!("Cannot accept override ask without other state");
                 }
-                let node = Node::new(self.this_state.clone(), self.other_state.take().unwrap());
+                // other state has accepted our override.
+                let node = Node::new(self.this_state.clone(), self.this_state.clone());
                 Ok((Some(node), None))
             }
         }
