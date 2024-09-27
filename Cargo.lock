@@ -366,6 +366,7 @@ dependencies = [
  "ignore",
  "notify-debouncer-full",
  "regex",
+ "shlex",
  "tempfile",
  "tokio",
  "tracing",

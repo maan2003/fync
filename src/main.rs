@@ -300,7 +300,7 @@ fn ssh_sync_command(
     cmd.arg(&remote_host)
         .arg("fync")
         .arg("-i")
-        .arg(ignore)
+        .arg(&*shlex::try_quote(ignore).unwrap())
         .arg("run-stdio")
         .arg(remote_root);
     if override_remote {
