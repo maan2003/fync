@@ -238,7 +238,7 @@ fn run_node(
         if let Some(response) = response {
             match &response {
                 NodeMessage::Changes {
-                    new_content: _,
+                    content_diff: _,
                     diff,
                 } => {
                     info!("Sending Changes: {} files", diff.files.len());

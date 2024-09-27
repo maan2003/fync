@@ -318,7 +318,7 @@ impl FsStateDiff {
 pub struct ContentStore {
     // todo: use better hash map
     contents: HashMap<ContentHash, Vec<u8>>,
-    new_contents: Vec<ContentHash>,
+    new_contents: HashSet<ContentHash>,
 }
 
 impl ContentStore {
@@ -330,7 +330,7 @@ impl ContentStore {
 
     pub fn insert(&mut self, hash: ContentHash, content: Vec<u8>) {
         if self.contents.insert(hash, content).is_none() {
-            self.new_contents.push(hash);
+            self.new_contents.insert(hash);
         }
     }
 
@@ -349,8 +349,76 @@ impl ContentStore {
         self.contents.contains_key(hash)
     }
 
-    pub fn drain_new_contents(&mut self) -> Vec<ContentHash> {
-        std::mem::take(&mut self.new_contents)
+    pub fn seen_from_other(&mut self, hash: &ContentHash) {
+        self.new_contents.remove(hash);
+    }
+
+    pub fn create_content_diff(&mut self, diff: &FsStateDiff) -> Result<ContentDiff> {
+        let mut content_diff = ContentDiff::new();
+
+        for (_, change) in &diff.files {
+            match change {
+                FileChange::Created { meta } => {
+                    if self.new_contents.remove(&meta.content_hash) {
+                        let content = self.get(&meta.content_hash)?;
+                        content_diff.add_new_content(content.to_vec());
+                    }
+                }
+                FileChange::Modified { old_meta, new_meta } => {
+                    let new_content_is_new = self.new_contents.remove(&new_meta.content_hash);
+                    let old_content_is_new = self.new_contents.remove(&old_meta.content_hash);
+                    let old_content = self.get(&old_meta.content_hash).ok();
+                    if let Some(old_content) = old_content {
+                        if old_content_is_new {
+                            content_diff.add_new_content(old_content.to_vec());
+                        }
+                    }
+
+                    if new_content_is_new {
+                        let new_content = self.get(&new_meta.content_hash)?;
+                        if let Some(old_content) = old_content {
+                            content_diff.add_modified_content(
+                                old_meta.content_hash.clone(),
+                                &old_content,
+                                &new_content,
+                            );
+                        } else {
+                            content_diff.add_new_content(new_content.to_vec());
+                        }
+                    }
+                }
+                FileChange::Removed { old_meta } => {
+                    if self.new_contents.remove(&old_meta.content_hash) {
+                        if let Some(old_content) = self.get(&old_meta.content_hash).ok() {
+                            content_diff.add_new_content(old_content.to_vec());
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(content_diff)
+    }
+
+    pub fn apply_content_diff_from_other(&mut self, content_diff: &ContentDiff) -> Result<()> {
+        for content in &content_diff.new_content {
+            let hash = blake3::hash(content);
+            self.contents.insert(hash, content.clone());
+        }
+
+        for compressed_diff in &content_diff.modified_content {
+            let old_content = self.get(&compressed_diff.old_hash)?;
+            // 100MB
+            const MAX_BYTES: usize = 1024 * 1024 * 1024 * 100;
+            let decompressed = zstd::bulk::Decompressor::with_dictionary(old_content)
+                .unwrap()
+                .decompress(&compressed_diff.data, MAX_BYTES)
+                .unwrap();
+            let new_hash = blake3::hash(&decompressed);
+            self.contents.insert(new_hash, decompressed);
+        }
+
+        Ok(())
     }
 }
 
@@ -361,10 +429,52 @@ pub struct Node {
     conflicts: Vec<FilePath>,
 }
 
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct ContentDiff {
+    new_content: Vec<Vec<u8>>,
+    modified_content: Vec<CompressedDiff>,
+}
+
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct CompressedDiff {
+    #[bincode(with_serde)]
+    old_hash: ContentHash,
+    data: Vec<u8>,
+}
+
+impl ContentDiff {
+    pub fn new() -> Self {
+        ContentDiff {
+            new_content: Vec::new(),
+            modified_content: Vec::new(),
+        }
+    }
+
+    pub fn add_new_content(&mut self, content: Vec<u8>) {
+        self.new_content.push(content);
+    }
+
+    pub fn add_modified_content(
+        &mut self,
+        old_hash: ContentHash,
+        old_content: &[u8],
+        new_content: &[u8],
+    ) {
+        let compressed_diff = zstd::bulk::Compressor::with_dictionary(0, &old_content)
+            .unwrap()
+            .compress(new_content)
+            .unwrap();
+        self.modified_content.push(CompressedDiff {
+            old_hash,
+            data: compressed_diff,
+        });
+    }
+}
+
 #[derive(Clone, Encode, Decode)]
 pub enum NodeMessage {
     Changes {
-        new_content: Vec<Vec<u8>>,
+        content_diff: ContentDiff,
         diff: FsStateDiff,
     },
     ChangesResponse {
@@ -381,11 +491,9 @@ pub enum RefreshRequest {
 impl std::fmt::Debug for NodeMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NodeMessage::Changes { new_content, diff } => f
-                .debug_struct("Changes")
-                .field("new_content", &new_content.len())
-                .field("diff", diff)
-                .finish(),
+            NodeMessage::Changes { diff, .. } => {
+                f.debug_struct("Changes").field("diff", diff).finish()
+            }
             NodeMessage::ChangesResponse { accepted_diff } => f
                 .debug_struct("ChangesResponse")
                 .field("accepted_diff", accepted_diff)
@@ -404,7 +512,7 @@ pub struct NodeInit {
 #[derive(Debug, Clone, Encode, Decode)]
 pub enum NodeInitMessage {
     NodeAnnouncement { state: FsState },
-    Override { new_content: Vec<Vec<u8>> },
+    Override { content_diff: ContentDiff },
     OverrideAck,
 }
 
@@ -434,21 +542,11 @@ impl NodeInit {
     }
 
     fn override_other(&mut self, content_store: &mut ContentStore) -> NodeInitMessage {
-        let new_content_hashes = content_store.drain_new_contents();
-        let other_hashes: HashSet<_> = self
-            .other_state
-            .as_ref()
-            .unwrap()
-            .files
-            .values()
-            .map(|meta| meta.content_hash)
-            .collect();
-        let new_content: Vec<Vec<u8>> = new_content_hashes
-            .into_iter()
-            .filter(|hash| !other_hashes.contains(hash))
-            .map(|hash| content_store.get(&hash).unwrap().to_vec())
-            .collect();
-        NodeInitMessage::Override { new_content }
+        let diff = self.this_state.diff(self.other_state.as_ref().unwrap());
+        let content_diff = content_store
+            .create_content_diff(&diff)
+            .expect("Failed to create content diff");
+        NodeInitMessage::Override { content_diff }
     }
 
     pub fn handle_init_message(
@@ -459,6 +557,10 @@ impl NodeInit {
     ) -> Result<(Option<Node>, Option<NodeInitMessage>)> {
         match message {
             NodeInitMessage::NodeAnnouncement { state: other_state } => {
+                // mark all hashes from other as seen
+                for (_, hash) in &other_state.files {
+                    content_store.seen_from_other(&hash.content_hash);
+                }
                 self.other_state = Some(other_state);
                 if self.should_override {
                     Ok((None, Some(self.override_other(content_store))))
@@ -466,19 +568,14 @@ impl NodeInit {
                     Ok((None, None))
                 }
             }
-            NodeInitMessage::Override { new_content } => {
+            NodeInitMessage::Override { content_diff } => {
                 if self.other_state.is_none() {
                     bail!("Cannot apply override without other state");
                 }
-                for content in new_content {
-                    content_store.add(content);
-                }
+                content_store.apply_content_diff_from_other(&content_diff)?;
                 let diff = self.this_state.diff(self.other_state.as_ref().unwrap());
-                self.other_state.as_mut().unwrap().apply_diff_to_disk(
-                    &diff,
-                    root,
-                    content_store,
-                )?;
+                self.this_state
+                    .apply_diff_to_disk(&diff, root, content_store)?;
                 let node = Node::new(self.this_state.clone(), self.other_state.take().unwrap());
                 Ok((Some(node), Some(NodeInitMessage::OverrideAck)))
             }
@@ -502,15 +599,11 @@ impl Node {
         }
     }
 
-    pub fn messages_for_other(&mut self, content_store: &mut ContentStore) -> NodeMessage {
+    pub fn messages_for_other(&mut self, content_store: &mut ContentStore) -> Result<NodeMessage> {
         let diff = self.changes_for_other();
-        let new_content_hashes = content_store.drain_new_contents();
-        let new_content = new_content_hashes
-            .into_iter()
-            .map(|hash| content_store.get(&hash).unwrap().to_vec())
-            .collect();
+        let content_diff = content_store.create_content_diff(&diff)?;
 
-        NodeMessage::Changes { new_content, diff }
+        Ok(NodeMessage::Changes { content_diff, diff })
     }
 
     pub fn handle_message_disk(
@@ -520,10 +613,8 @@ impl Node {
         content_store: &mut ContentStore,
     ) -> Result<Option<NodeMessage>> {
         match message {
-            NodeMessage::Changes { new_content, diff } => {
-                for content in new_content {
-                    content_store.add(content);
-                }
+            NodeMessage::Changes { content_diff, diff } => {
+                content_store.apply_content_diff_from_other(&content_diff)?;
                 let accepted_diff =
                     self.apply_changes_from_other_to_disk(&diff, root, content_store)?;
                 Ok(Some(NodeMessage::ChangesResponse { accepted_diff }))
@@ -541,10 +632,8 @@ impl Node {
         content_store: &mut ContentStore,
     ) -> Result<Option<NodeMessage>> {
         match message {
-            NodeMessage::Changes { new_content, diff } => {
-                for content in new_content {
-                    content_store.add(content);
-                }
+            NodeMessage::Changes { content_diff, diff } => {
+                content_store.apply_content_diff_from_other(&content_diff)?;
                 let accepted_diff = self.apply_changes_from_other_mem(&diff);
                 Ok(Some(NodeMessage::ChangesResponse { accepted_diff }))
             }
@@ -638,13 +727,9 @@ impl Node {
         if diff.is_empty() {
             return Ok(None);
         }
-        let new_content_hashes = content_store.drain_new_contents();
-        let new_content = new_content_hashes
-            .into_iter()
-            .map(|hash| content_store.get(&hash).unwrap().to_vec())
-            .collect();
 
-        Ok(Some(NodeMessage::Changes { new_content, diff }))
+        let content_diff = content_store.create_content_diff(&diff)?;
+        Ok(Some(NodeMessage::Changes { content_diff, diff }))
     }
 
     pub fn has_conflicts(&self) -> bool {
