@@ -315,7 +315,7 @@ fn ssh_sync_command(
     let result = run_node_with_io(
         &local_root,
         !override_remote,
-        ignore,
+        &regex,
         child_stdout,
         child_stdin,
     );
