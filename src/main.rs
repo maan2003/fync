@@ -116,7 +116,7 @@ fn run_node_with_io<R: Read + Send + 'static, W: Write + Send + 'static>(
     reader: R,
     writer: W,
 ) -> Result<()> {
-    info!(?regex, "running with filter");
+    info!(?ignore, "running with filter");
     let (input_tx, input_rx) = crossbeam_channel::unbounded();
     let (output_tx, output_rx) = crossbeam_channel::unbounded();
 
