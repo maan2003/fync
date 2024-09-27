@@ -116,6 +116,7 @@ fn run_node_with_io<R: Read + Send + 'static, W: Write + Send + 'static>(
     reader: R,
     writer: W,
 ) -> Result<()> {
+    info!(?regex, "running with filter");
     let (input_tx, input_rx) = crossbeam_channel::unbounded();
     let (output_tx, output_rx) = crossbeam_channel::unbounded();
 
@@ -285,7 +286,7 @@ fn debounce_watcher(
                 }
                 RefreshRequest::Path(path) => path.to_str().map_or(false, |x| !ignore.is_match(x)),
             };
-            if found {
+            if !found {
                 info!(?x, "discarding");
             }
             found
