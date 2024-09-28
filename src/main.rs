@@ -314,7 +314,7 @@ fn ssh_sync_command_with_retry(
 
         let start_time = Instant::now();
 
-        match run_ssh_process(
+        match ssh_sync_command(
             &local_root,
             &remote_host,
             &remote_root,
