@@ -267,7 +267,7 @@ fn debounce_watcher(
     let max_deadline = Instant::now() + Duration::from_millis(100);
     loop {
         // wait small duration for new event to come.
-        let deadline = Instant::now() + Duration::from_millis(7);
+        let deadline = Instant::now() + Duration::from_millis(15);
         match rx.recv_deadline(deadline.min(max_deadline)) {
             Ok(path_list) => paths.extend(path_list),
             Err(RecvTimeoutError::Timeout) => break,
