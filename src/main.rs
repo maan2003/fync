@@ -9,8 +9,9 @@ use std::io::{stderr, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread::scope;
+use std::thread::sleep;
 use std::time::{Duration, Instant};
-use tracing::{debug, info, instrument};
+use tracing::{debug, error, info, instrument};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -64,7 +65,7 @@ fn main() -> Result<()> {
             remote_host,
             remote_root,
             override_remote,
-        } => ssh_sync_command(
+        } => ssh_sync_command_with_retry(
             local_root,
             remote_host,
             remote_root,
@@ -292,23 +293,75 @@ fn debounce_watcher(
         })
         .collect())
 }
-fn ssh_sync_command(
+
+fn ssh_sync_command_with_retry(
     local_root: PathBuf,
     remote_host: String,
     remote_root: PathBuf,
     override_remote: bool,
     ignore: &str,
 ) -> Result<()> {
-    let regex = Regex::new(ignore).unwrap();
-    let local_root = local_root.canonicalize()?;
+    const MAX_RETRIES: u32 = 10;
+    const RETRY_DELAY: Duration = Duration::from_secs(5);
+    const RESET_THRESHOLD: Duration = Duration::from_secs(60); // 1 minute
 
+    let mut attempt = 1;
+    loop {
+        info!(
+            "Attempting SSH connection (attempt {} of {})",
+            attempt, MAX_RETRIES
+        );
+
+        let start_time = Instant::now();
+
+        match run_ssh_process(
+            &local_root,
+            &remote_host,
+            &remote_root,
+            override_remote,
+            ignore,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                let connection_duration = start_time.elapsed();
+
+                if connection_duration >= RESET_THRESHOLD {
+                    debug!(
+                        "Connection was active for more than 1 minute. Resetting attempt count."
+                    );
+                    attempt = 1;
+                } else {
+                    attempt += 1;
+                }
+
+                error!("SSH connection failed: {:?}", e);
+                if attempt <= MAX_RETRIES {
+                    info!("Retrying in {} seconds...", RETRY_DELAY.as_secs());
+                    sleep(RETRY_DELAY);
+                } else {
+                    return Err(e.context("Max retries reached for SSH connection"));
+                }
+            }
+        }
+    }
+}
+
+fn ssh_sync_command(
+    local_root: &Path,
+    remote_host: &str,
+    remote_root: &Path,
+    override_remote: bool,
+    ignore: &str,
+) -> Result<()> {
+    let local_root = local_root.canonicalize()?;
+    let regex = Regex::new(ignore).unwrap();
     let mut cmd = Command::new("ssh");
     cmd.arg(&remote_host)
         .arg("fync")
         .arg("-i")
         .arg(&*shlex::try_quote(ignore).unwrap())
         .arg("run-stdio")
-        .arg(remote_root);
+        .arg(&remote_root);
     if override_remote {
         cmd.arg("-o");
     }
