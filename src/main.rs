@@ -263,9 +263,12 @@ fn debounce_watcher(
 ) -> Result<Vec<RefreshRequest>, RecvError> {
     let mut paths = BTreeSet::new();
     paths.extend(path_list);
-    let debounce_deadline = Instant::now() + Duration::from_millis(20);
+    // always break after 100ms
+    let max_deadline = Instant::now() + Duration::from_millis(100);
     loop {
-        match rx.recv_deadline(debounce_deadline) {
+        // wait small duration for new event to come.
+        let deadline = Instant::now() + Duration::from_millis(7);
+        match rx.recv_deadline(deadline.min(max_deadline)) {
             Ok(path_list) => paths.extend(path_list),
             Err(RecvTimeoutError::Timeout) => break,
             Err(RecvTimeoutError::Disconnected) => {
