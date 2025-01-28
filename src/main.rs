@@ -148,7 +148,7 @@ fn run_node_with_io<R: Read + Send + 'static, W: Write + Send + 'static>(
                     return Ok(());
                 }
                 Err(e) => {
-                    return Err(e);
+                    return Err(e.into());
                 }
             }
         }
