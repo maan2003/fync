@@ -61,7 +61,7 @@ impl FileMetadata {
 impl FsState {
     pub fn from_disk(root: &Path, content_store: &mut ContentStore) -> Result<Self> {
         let mut files = BTreeMap::new();
-        for entry in ignore::Walk::new(root) {
+        for entry in ignore::WalkBuilder::new(root).require_git(false).build() {
             let entry = entry?;
             if entry.file_type().map_or(false, |d| d.is_file()) {
                 let file_path = FilePath::from_root_and_path(entry.path(), root)?;
@@ -150,7 +150,7 @@ impl FsState {
         }
 
         // Walk the directory and update/add entries
-        for entry in ignore::Walk::new(&full_dir_path) {
+        for entry in ignore::WalkBuilder::new(root).require_git(false).build() {
             let Ok(entry) = entry else {
                 continue;
             };

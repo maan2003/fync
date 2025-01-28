@@ -34,6 +34,8 @@ enum Commands {
         root: PathBuf,
         #[arg(short)]
         override_other: bool,
+        #[arg(short = "1")]
+        once: bool,
     },
     SshSync {
         local_root: PathBuf,
@@ -41,6 +43,8 @@ enum Commands {
         remote_root: PathBuf,
         #[arg(short)]
         override_remote: bool,
+        #[arg(short = "1")]
+        once: bool,
     },
 }
 
@@ -59,18 +63,21 @@ fn main() -> Result<()> {
         Commands::RunStdio {
             root,
             override_other,
-        } => run_node_stdio(&root, override_other, &regex),
+            once,
+        } => run_node_stdio(&root, override_other, &regex, once),
         Commands::SshSync {
             local_root,
             remote_host,
             remote_root,
             override_remote,
+            once,
         } => ssh_sync_command_with_retry(
             local_root,
             remote_host,
             remote_root,
             override_remote,
             &args.ignore_regex,
+            once,
         ),
     }
 }
@@ -103,8 +110,8 @@ fn sync_command(src: PathBuf, dst: PathBuf, ignore: &Regex) -> Result<()> {
     let (dst_out, src_in) = crossbeam_channel::bounded::<AnyNodeMessage>(32);
     let (src_out, dst_in) = crossbeam_channel::bounded::<AnyNodeMessage>(32);
     scope(|s| {
-        s.spawn(|| run_node(&src_root, src_in, src_out, true, ignore));
-        s.spawn(|| run_node(&dst_root, dst_in, dst_out, false, ignore));
+        s.spawn(|| run_node(&src_root, src_in, src_out, true, ignore, false));
+        s.spawn(|| run_node(&dst_root, dst_in, dst_out, false, ignore, false));
         info!("Watching for changes. Press Ctrl+C to exit.");
     });
     Ok(())
@@ -116,6 +123,7 @@ fn run_node_with_io<R: Read + Send + 'static, W: Write + Send + 'static>(
     ignore: &Regex,
     reader: R,
     writer: W,
+    once: bool,
 ) -> Result<()> {
     let (input_tx, input_rx) = crossbeam_channel::unbounded();
     let (output_tx, output_rx) = crossbeam_channel::unbounded();
@@ -137,7 +145,7 @@ fn run_node_with_io<R: Read + Send + 'static, W: Write + Send + 'static>(
         anyhow::Ok(())
     });
 
-    let result = run_node(&root, input_rx, output_tx, override_other, &ignore);
+    let result = run_node(&root, input_rx, output_tx, override_other, &ignore, once);
 
     read_thread
         .join()
@@ -151,7 +159,7 @@ fn run_node_with_io<R: Read + Send + 'static, W: Write + Send + 'static>(
     result
 }
 
-fn run_node_stdio(root: &Path, override_other: bool, ignore: &Regex) -> Result<()> {
+fn run_node_stdio(root: &Path, override_other: bool, ignore: &Regex, once: bool) -> Result<()> {
     let root = root.canonicalize()?;
     run_node_with_io(
         &root,
@@ -159,6 +167,7 @@ fn run_node_stdio(root: &Path, override_other: bool, ignore: &Regex) -> Result<(
         ignore,
         std::io::stdin(),
         std::io::stdout(),
+        once,
     )
 }
 
@@ -169,6 +178,7 @@ fn run_node(
     output: Sender<AnyNodeMessage>,
     override_other: bool,
     ignore: &Regex,
+    once: bool,
 ) -> std::result::Result<(), anyhow::Error> {
     // first start watching
     let (watch_tx, watch_rx) = crossbeam_channel::bounded(32);
@@ -193,6 +203,10 @@ fn run_node(
     };
 
     info!("Initial sync completed successfully");
+
+    if once {
+        return Ok(());
+    }
 
     loop {
         #[derive(Debug)]
@@ -300,6 +314,7 @@ fn ssh_sync_command_with_retry(
     remote_root: PathBuf,
     override_remote: bool,
     ignore: &str,
+    once: bool,
 ) -> Result<()> {
     const MAX_RETRIES: u32 = 10;
     const RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -320,6 +335,7 @@ fn ssh_sync_command_with_retry(
             &remote_root,
             override_remote,
             ignore,
+            once,
         ) {
             Ok(_) => return Ok(()),
             Err(e) => {
@@ -352,6 +368,7 @@ fn ssh_sync_command(
     remote_root: &Path,
     override_remote: bool,
     ignore: &str,
+    once: bool,
 ) -> Result<()> {
     let local_root = local_root.canonicalize()?;
     let regex = Regex::new(ignore).unwrap();
@@ -365,6 +382,9 @@ fn ssh_sync_command(
     if override_remote {
         cmd.arg("-o");
     }
+    if once {
+        cmd.arg("-1");
+    }
     // Spawn the SSH process
     let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
 
@@ -377,6 +397,7 @@ fn ssh_sync_command(
         &regex,
         child_stdout,
         child_stdin,
+        once,
     );
 
     // Wait for the child process to finish
