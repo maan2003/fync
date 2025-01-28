@@ -35,7 +35,7 @@ enum Commands {
         root: PathBuf,
         #[arg(short)]
         override_other: bool,
-        #[arg(short = "1")]
+        #[arg(short = '1')]
         once: bool,
         #[arg(short, long)]
         mkdir: bool,
@@ -46,7 +46,7 @@ enum Commands {
         remote_root: PathBuf,
         #[arg(short)]
         override_remote: bool,
-        #[arg(short = "1")]
+        #[arg(short = '1')]
         once: bool,
         #[arg(short, long)]
         mkdir: bool,
