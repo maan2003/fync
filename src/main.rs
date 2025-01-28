@@ -5,6 +5,7 @@ use crossbeam_channel::{Receiver, RecvError, RecvTimeoutError, Sender};
 use fync::{watch_root, AnyNodeMessage, ContentStore, NodeInit, NodeMessage, RefreshRequest};
 use regex::Regex;
 use std::collections::BTreeSet;
+use std::fs;
 use std::io::{stderr, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -36,6 +37,8 @@ enum Commands {
         override_other: bool,
         #[arg(short = "1")]
         once: bool,
+        #[arg(short, long)]
+        mkdir: bool,
     },
     SshSync {
         local_root: PathBuf,
@@ -45,6 +48,8 @@ enum Commands {
         override_remote: bool,
         #[arg(short = "1")]
         once: bool,
+        #[arg(short, long)]
+        mkdir: bool,
     },
 }
 
@@ -64,13 +69,15 @@ fn main() -> Result<()> {
             root,
             override_other,
             once,
-        } => run_node_stdio(&root, override_other, &regex, once),
+            mkdir,
+        } => run_node_stdio(&root, override_other, &regex, once, mkdir),
         Commands::SshSync {
             local_root,
             remote_host,
             remote_root,
             override_remote,
             once,
+            mkdir,
         } => ssh_sync_command_with_retry(
             local_root,
             remote_host,
@@ -78,6 +85,7 @@ fn main() -> Result<()> {
             override_remote,
             &args.ignore_regex,
             once,
+            mkdir,
         ),
     }
 }
@@ -159,7 +167,16 @@ fn run_node_with_io<R: Read + Send + 'static, W: Write + Send + 'static>(
     result
 }
 
-fn run_node_stdio(root: &Path, override_other: bool, ignore: &Regex, once: bool) -> Result<()> {
+fn run_node_stdio(
+    root: &Path,
+    override_other: bool,
+    ignore: &Regex,
+    once: bool,
+    mkdir: bool,
+) -> Result<()> {
+    if mkdir {
+        fs::create_dir(root)?;
+    }
     let root = root.canonicalize()?;
     run_node_with_io(
         &root,
@@ -315,6 +332,7 @@ fn ssh_sync_command_with_retry(
     override_remote: bool,
     ignore: &str,
     once: bool,
+    mkdir: bool,
 ) -> Result<()> {
     const MAX_RETRIES: u32 = 10;
     const RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -336,6 +354,7 @@ fn ssh_sync_command_with_retry(
             override_remote,
             ignore,
             once,
+            mkdir,
         ) {
             Ok(_) => return Ok(()),
             Err(e) => {
@@ -369,6 +388,7 @@ fn ssh_sync_command(
     override_remote: bool,
     ignore: &str,
     once: bool,
+    mkdir: bool,
 ) -> Result<()> {
     let local_root = local_root.canonicalize()?;
     let regex = Regex::new(ignore).unwrap();
@@ -384,6 +404,9 @@ fn ssh_sync_command(
     }
     if once {
         cmd.arg("-1");
+    }
+    if mkdir {
+        cmd.arg("--mkdir");
     }
     // Spawn the SSH process
     let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
