@@ -175,7 +175,7 @@ fn run_node_stdio(
     mkdir: bool,
 ) -> Result<()> {
     if mkdir {
-        fs::create_dir(root)?;
+        fs::create_dir_all(root)?;
     }
     let root = root.canonicalize()?;
     run_node_with_io(
