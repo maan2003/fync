@@ -1,12 +1,13 @@
 use anyhow::{bail, Context, Result};
 use bincode::config::standard;
+use bincode::error::DecodeError;
 use clap::{Parser, Subcommand};
 use crossbeam_channel::{Receiver, RecvError, RecvTimeoutError, Sender};
 use fync::{watch_root, AnyNodeMessage, ContentStore, NodeInit, NodeMessage, RefreshRequest};
 use regex::Regex;
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{stderr, BufReader, BufWriter, Read, Write};
+use std::io::{stderr, BufReader, BufWriter, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread::scope;
@@ -139,8 +140,17 @@ fn run_node_with_io<R: Read + Send + 'static, W: Write + Send + 'static>(
     let read_thread = std::thread::spawn(move || -> Result<()> {
         let mut reader = BufReader::new(reader);
         loop {
-            let msg = bincode::decode_from_reader(&mut reader, standard())?;
-            input_tx.send(msg)?;
+            match bincode::decode_from_reader(&mut reader, standard()) {
+                Ok(msg) => {
+                    input_tx.send(msg)?;
+                }
+                Err(DecodeError::Io { inner, .. }) if inner.kind() == ErrorKind::UnexpectedEof => {
+                    return Ok(());
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
         }
     });
 
